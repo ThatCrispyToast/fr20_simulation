@@ -1,0 +1,1 @@
+**Pallet Dimensions**: 1092.2 mm x 1219.2 mm x 838.2 mm
