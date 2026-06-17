@@ -20,11 +20,17 @@ uv sync
 uv run python src/bin_reach.py
 ```
 
-The default sweep is wide on all axes — `11 (x) × 11 (y) × 11 (z) = 1331` mount
-positions, each tested against `6 × 6 × 4 = 144` pick targets. Every target is
-checked with multiple IK seeds (see below), so a full run takes on the order of
-**an hour**; the progress bar shows elapsed time and ETA. For quicker iteration,
-shrink the `BASE_*_RANGE` arrays or lower `N_IK_SEEDS`.
+The default sweep is wide on all axes — `11 (x) × 11 (y) × 11 (z) × 4 (yaw) =
+5324` mount poses, each tested against `6 × 6 × 4 = 144` pick targets. The yaw
+axis rotates the base about the vertical: the arm's reachable envelope is not
+axisymmetric over a rectangular bin (joint 1 has a ~±175° dead wedge and the
+shoulder/elbow offset clears the walls differently per heading), so heading
+changes coverage. The XY/height heatmaps show the **best coverage over all yaws**
+at each cell, and the reported best base includes its winning yaw. Every target
+is checked with multiple IK seeds (see below), so a full run is long; the
+progress bar shows elapsed time and ETA. For quicker iteration, shrink the
+`BASE_*_RANGE` arrays (set `BASE_YAW_RANGE = [0.0]` to disable the yaw search) or
+lower `N_IK_SEEDS`.
 
 ### Why multiple IK seeds
 

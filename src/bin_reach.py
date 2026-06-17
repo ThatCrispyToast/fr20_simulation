@@ -66,6 +66,14 @@ BASE_X_RANGE = np.linspace(-0.70, 0.70, 11)
 BASE_Y_RANGE = np.linspace(-0.70, 0.70, 11)
 BASE_Z_RANGE = MOUNT_HEIGHT + np.linspace(-0.40, 0.40, 11)  # mount heights to try
 
+# Base yaw sweep (rotation about the vertical axis, radians). The arm's reachable
+# envelope is NOT axisymmetric over a rectangular bin: joint 1 is limited to
+# ~+/-175deg (a dead wedge behind the arm) and the shoulder/elbow offset clears
+# the four walls differently per heading, so heading changes which targets are
+# reachable. The bin is ~symmetric under 180deg, so 0..90deg covers the distinct
+# headings. Set to [0.0] to disable the yaw search.
+BASE_YAW_RANGE = np.deg2rad(np.linspace(0.0, 90.0, 4))   # [0, 30, 60, 90] deg
+
 # Target sampling inside the bin
 N_X, N_Y, N_Z = 6, 6, 4          # grid resolution of pick targets
 MARGIN = 0.06                    # keep targets this far inside the walls/floor
@@ -148,11 +156,18 @@ def make_bin():
     )
     return body
 
-def load_robot(base_xy, height=MOUNT_HEIGHT):
+def base_orientation(yaw=0.0):
+    """Base quaternion: the hang-down flip (180deg about X) with `yaw` applied
+    about the world vertical axis. getQuaternionFromEuler([r,p,y]) yields
+    Rz(y)*Ry(p)*Rx(r), so Rx(pi) flips the arm down and Rz(yaw) then swings its
+    heading around the vertical."""
+    roll = math.pi if FLIP_BASE else 0.0
+    return p.getQuaternionFromEuler([roll, 0, yaw])
+
+def load_robot(base_xy, height=MOUNT_HEIGHT, yaw=0.0):
     cx, cy = BIN_CENTER_XY
-    ori = p.getQuaternionFromEuler([math.pi, 0, 0]) if FLIP_BASE else [0, 0, 0, 1]
     pos = [cx + base_xy[0], cy + base_xy[1], height]
-    rid = p.loadURDF(ROBOT_URDF, pos, ori, useFixedBase=FIXED_BASE)
+    rid = p.loadURDF(ROBOT_URDF, pos, base_orientation(yaw), useFixedBase=FIXED_BASE)
     return rid
 
 def movable_joints(rid):
@@ -247,12 +262,11 @@ def reachable(rid, bin_id, ee_link, joints, lo, hi, target, orientations, seeds)
 # ----------------------------------------------------------------------------
 # Main sweep
 # ----------------------------------------------------------------------------
-def set_base(rid, base_xy, height):
-    """Move the (fixed) robot base to a new mount point."""
+def set_base(rid, base_xy, height, yaw=0.0):
+    """Move the (fixed) robot base to a new mount point and heading."""
     cx, cy = BIN_CENTER_XY
-    ori = p.getQuaternionFromEuler([math.pi, 0, 0]) if FLIP_BASE else [0, 0, 0, 1]
     p.resetBasePositionAndOrientation(
-        rid, [cx + base_xy[0], cy + base_xy[1], height], ori)
+        rid, [cx + base_xy[0], cy + base_xy[1], height], base_orientation(yaw))
 
 def run():
     connect()
@@ -268,6 +282,8 @@ def run():
     ee = EE_LINK if EE_LINK is not None else p.getNumJoints(rid) - 1
     seeds = ik_seeds(lo, hi)
 
+    # coverage[iz,iy,ix] holds the BEST coverage at that XY/height over all yaws,
+    # so the heatmaps stay 2D-per-height; `best` tracks the winning yaw too.
     coverage = np.zeros((len(BASE_Z_RANGE), len(BASE_Y_RANGE), len(BASE_X_RANGE)))
     target_hits = np.zeros(len(targets))   # how many base poses reach each target
     best = {"cov": -1}
@@ -276,49 +292,56 @@ def run():
     if SHOW_SIM:
         print("GUI: watch the arm scan each mount position; the full sweep takes "
               "a while, so use a smaller grid if you just want a quick look.")
-    total = len(BASE_Z_RANGE) * len(BASE_Y_RANGE) * len(BASE_X_RANGE)
+    total = (len(BASE_YAW_RANGE) * len(BASE_Z_RANGE)
+             * len(BASE_Y_RANGE) * len(BASE_X_RANGE))
     done, t0 = 0, time.time()
-    for iz, bz in enumerate(BASE_Z_RANGE):
-        for iy, by in enumerate(BASE_Y_RANGE):
-            for ix, bx in enumerate(BASE_X_RANGE):
-                set_base(rid, (bx, by), bz)
-                mask = np.array([
-                    reachable(rid, bin_id, ee, joints, lo, hi, t, orientations, seeds)
-                    for t in targets
-                ])
-                cov = mask.mean()
-                coverage[iz, iy, ix] = cov
-                target_hits += mask
-                if cov > best["cov"]:
-                    best = {"cov": cov, "xy": (bx, by), "z": bz, "mask": mask}
-                done += 1
-                progress_bar(done, total, t0)
-                if SHOW_SIM:
-                    # settle the arm on a reachable pick so the scan is watchable
-                    reach_pts = targets[mask]
-                    if len(reach_pts):
-                        pose_at(rid, ee, joints, lo, hi,
-                                reach_pts[len(reach_pts) // 2], orientations)
-                    elapsed = time.time() - t0
-                    eta = elapsed / done * (total - done)
-                    hud_update(hud, [
-                        "FR20 bin reachability  -  SWEEP",
-                        f"base   x={bx:+.2f}  y={by:+.2f}  z={bz:.2f} m",
-                        f"coverage here:   {cov*100:4.1f}%   "
-                        f"({int(mask.sum())}/{len(targets)} picks)",
-                        f"best so far:   {best['cov']*100:4.1f}%   "
-                        f"@ x={best['xy'][0]:+.2f} y={best['xy'][1]:+.2f} "
-                        f"z={best['z']:.2f}",
-                        f"progress:   {done}/{total}  ({done/total*100:4.1f}%)",
-                        f"elapsed {_fmt_mmss(elapsed)}    eta {_fmt_mmss(eta)}",
+    for iyaw, byaw in enumerate(BASE_YAW_RANGE):
+        for iz, bz in enumerate(BASE_Z_RANGE):
+            for iy, by in enumerate(BASE_Y_RANGE):
+                for ix, bx in enumerate(BASE_X_RANGE):
+                    set_base(rid, (bx, by), bz, byaw)
+                    mask = np.array([
+                        reachable(rid, bin_id, ee, joints, lo, hi, t,
+                                  orientations, seeds)
+                        for t in targets
                     ])
-                    time.sleep(SIM_DWELL)
+                    cov = mask.mean()
+                    coverage[iz, iy, ix] = max(coverage[iz, iy, ix], cov)
+                    target_hits += mask
+                    if cov > best["cov"]:
+                        best = {"cov": cov, "xy": (bx, by), "z": bz,
+                                "yaw": byaw, "mask": mask}
+                    done += 1
+                    progress_bar(done, total, t0)
+                    if SHOW_SIM:
+                        # settle the arm on a reachable pick so the scan is watchable
+                        reach_pts = targets[mask]
+                        if len(reach_pts):
+                            pose_at(rid, ee, joints, lo, hi,
+                                    reach_pts[len(reach_pts) // 2], orientations)
+                        elapsed = time.time() - t0
+                        eta = elapsed / done * (total - done)
+                        hud_update(hud, [
+                            "FR20 bin reachability  -  SWEEP",
+                            f"base   x={bx:+.2f}  y={by:+.2f}  z={bz:.2f} m  "
+                            f"yaw={math.degrees(byaw):+.0f}deg",
+                            f"coverage here:   {cov*100:4.1f}%   "
+                            f"({int(mask.sum())}/{len(targets)} picks)",
+                            f"best so far:   {best['cov']*100:4.1f}%   "
+                            f"@ x={best['xy'][0]:+.2f} y={best['xy'][1]:+.2f} "
+                            f"z={best['z']:.2f} yaw={math.degrees(best['yaw']):+.0f}",
+                            f"progress:   {done}/{total}  ({done/total*100:4.1f}%)",
+                            f"elapsed {_fmt_mmss(elapsed)}    eta {_fmt_mmss(eta)}",
+                        ])
+                        time.sleep(SIM_DWELL)
     target_freq = target_hits / total      # fraction of bases reaching each target
 
     print(f"\nBest base offset: x={best['xy'][0]:+.3f} m, "
-          f"y={best['xy'][1]:+.3f} m, z={best['z']:.3f} m  ->  "
+          f"y={best['xy'][1]:+.3f} m, z={best['z']:.3f} m, "
+          f"yaw={math.degrees(best['yaw']):+.1f} deg  ->  "
           f"coverage {best['cov']*100:.1f}%")
     print(f"Heights tried: {[round(float(z), 3) for z in BASE_Z_RANGE]} m | "
+          f"yaws tried: {[round(math.degrees(y), 1) for y in BASE_YAW_RANGE]} deg | "
           f"targets evaluated: {len(targets)}")
 
     # --- diagrams ---
@@ -386,10 +409,10 @@ def plot_coverage_grid(coverage, best):
                        s=240, edgecolors="white", linewidths=0.8, zorder=5,
                        label="best base")
             ax.legend(loc="upper right", fontsize=8)
-    fig.suptitle(f"Bin coverage vs. base position   |   best: "
-                 f"x={best['xy'][0]:+.2f}, y={best['xy'][1]:+.2f}, "
-                 f"z={best['z']:.2f} m  ->  {best['cov']*100:.1f}%   "
-                 f"(dashed = bin footprint)", fontsize=11)
+    fig.suptitle(f"Bin coverage vs. base position (best over yaw per cell)   |   "
+                 f"best: x={best['xy'][0]:+.2f}, y={best['xy'][1]:+.2f}, "
+                 f"z={best['z']:.2f} m, yaw={math.degrees(best['yaw']):+.0f}deg  ->  "
+                 f"{best['cov']*100:.1f}%   (dashed = bin footprint)", fontsize=11)
     fig.colorbar(im, ax=axes.ravel().tolist(), label="coverage %")
     path = os.path.join(OUT_DIR, "coverage_vs_base.png")
     fig.savefig(path, dpi=130)
@@ -419,8 +442,8 @@ def plot_best_slices(best, xs, ys, zs):
             a.set_ylabel("y (m)")
     fig.suptitle(f"Reachable pick points by depth at best base  "
                  f"(x={best['xy'][0]:+.2f}, y={best['xy'][1]:+.2f}, "
-                 f"z={best['z']:.2f} m)   green = reachable, red = not",
-                 fontsize=11)
+                 f"z={best['z']:.2f} m, yaw={math.degrees(best['yaw']):+.0f}deg)   "
+                 f"green = reachable, red = not", fontsize=11)
     fig.tight_layout()
     path = os.path.join(OUT_DIR, "best_pos_slices.png")
     fig.savefig(path, dpi=130)
@@ -561,7 +584,7 @@ def pose_at(rid, ee, joints, lo, hi, target, orientations):
 def visualize_best(rid, ee, joints, lo, hi, targets, orientations, best, hud=None):
     """At the best base, mark every target (green=reachable, red=not) and
     drive the arm through the reachable points so you can watch it work."""
-    set_base(rid, best["xy"], best["z"])
+    set_base(rid, best["xy"], best["z"], best["yaw"])
     reach_pts = targets[best["mask"]]
     miss_pts  = targets[~best["mask"]]
     if len(reach_pts):
@@ -580,7 +603,7 @@ def visualize_best(rid, ee, joints, lo, hi, targets, orientations, best, hud=Non
                 hud_update(hud, [
                     "FR20 bin reachability  -  BEST BASE",
                     f"base   x={best['xy'][0]:+.2f}  y={best['xy'][1]:+.2f}  "
-                    f"z={best['z']:.2f} m",
+                    f"z={best['z']:.2f} m  yaw={math.degrees(best['yaw']):+.0f}deg",
                     f"coverage:   {best['cov']*100:4.1f}%",
                     f"reachable picks:   {n}/{len(targets)}",
                     f"picking target   {i+1}/{n}",
