@@ -5,30 +5,47 @@ What it does
 ------------
 - Builds a deep bin (floor + 4 walls) from box collision shapes.
 - Mounts a robot arm overhead, hanging down over the bin.
-- Sweeps a grid of base XY positions (and you can add height).
-- For each base position, samples a 3D grid of target points inside the bin,
-  solves IK with the tool pointing down, and counts a target as REACHABLE only if:
-      (1) IK returns a solution,
-      (2) forward kinematics confirms the tool actually reaches it (FK error < tol),
-      (3) no robot link penetrates the bin walls/floor,
-      (4) the solution is within joint limits.
-- Reports the best base position by coverage and saves two heatmaps:
-      coverage_vs_base.png   -> coverage % across the base-position grid
-      best_pos_slices.png    -> which target points are reachable, layer by layer
+- Models the end effector as a flat vacuum gripper (face parallel to the ground,
+  picks straight down): a stand-off from the flange to the suction face plus a flat
+  footprint that has to clear the walls.
+- Sweeps a grid of base XYZ positions and headings (yaw).
+- For each base pose, samples a 3D grid of target points inside the bin and counts a
+  target as REACHABLE only if some IK solution (over several seeds) satisfies ALL of:
+      (1) the SUCTION FACE lands on the target (FK error < FK_TOL),
+      (2) the tool stays parallel to the ground (tilt < TILT_CONE_DEG + ORI_TOL_DEG),
+      (3) the solution is within joint limits,
+      (4) no robot link penetrates the bin walls/floor,
+      (5) the arm does not collide with itself,
+      (6) the gripper body does not penetrate the walls (corner/edge clearance; with
+          vertical walls this also implies clearance for the straight-down descent).
+- Reports the top-N base poses by coverage (run() returns them as an array) and,
+  after every run, writes to out/run_<timestamp>/: five diagnostic diagrams, a
+  reproducible end animation of the best base cycling its reachable picks
+  (best_pick_cycle.gif, rendered offline -- no GUI needed), and a detailed data
+  bundle on the top-N bases (best_versions.json + best_versions.npz: per-pick joint
+  solutions, FK error, tool tilt, per-depth counts, and raw arrays).
 
-Swap in your own robot
-----------------------
-Set ROBOT_URDF to your arm's URDF and adjust EE_LINK (or leave None to auto-pick
-the last link). Set the bin dimensions and the base sweep to match your cell.
+Performance: the sweep is embarrassingly parallel across base poses, so it runs on
+N_WORKERS processes (each its own headless PyBullet world). Results are identical to a
+single-process run. Set SHOW_SIM=True to watch it (forces a single process).
+
+Swap in your own robot / gripper
+--------------------------------
+Set ROBOT_URDF to your arm's URDF and adjust EE_LINK (or leave None to auto-pick the
+last link). Edit the gripper dimensions (GRIPPER_STANDOFF / RADIUS / THICKNESS) to
+match your tool. Set the bin dimensions and the base sweep to match your cell.
 Everything you'll touch is in the CONFIG block.
 """
 
 import os
+import json
 import math
 import time
+import multiprocessing as mp
 import numpy as np
 import pybullet as p
 import pybullet_data
+from PIL import Image
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -46,9 +63,10 @@ ROBOT_URDF = os.path.join(_HERE, "..", "resources", "fairino20_v6.urdf")
 EE_LINK    = None        # link index of the tool tip; None = auto (last link)
 FIXED_BASE = True
 
-SHOW_SIM  = False         # True = open a PyBullet GUI and watch the arm work
+SHOW_SIM  = True         # True = open a PyBullet GUI and watch the arm work
 SIM_DWELL = 0.05         # seconds the GUI lingers on each pose so motion is visible
-OUT_DIR   = os.path.join(_HERE, "..", "out")  # heatmap images are written here
+OUT_DIR   = os.path.join(_HERE, "..", "out")  # base output dir; each run writes
+RUN_DIR   = OUT_DIR                            # to a timestamped subfolder (set in run())
 
 # Bin geometry (meters). Interior floor sits at z=0, opening at z=BIN_DEPTH.
 # Pallet from resources/bin_info.md: 1092.2 x 1219.2 x 838.2 mm.
@@ -60,6 +78,20 @@ BIN_CENTER_XY = (0.0, 0.0)                          # bin center in world XY
 # FR20 reach ~1.7 m; base must clear the 0.838 m opening yet still touch the floor.
 MOUNT_HEIGHT = 1.35      # world z of the robot base
 FLIP_BASE = True         # rotate base 180deg about X so the arm hangs down
+
+# ----------------------------------------------------------------------------
+# Vacuum gripper -- SWAP YOUR TOOL HERE
+# ----------------------------------------------------------------------------
+# A flat vacuum gripper whose suction face stays parallel to the ground and picks
+# straight down. The tool adds a STAND-OFF (the flange sits this far above the
+# suction contact point, so the arm reaches deeper) and a flat FOOTPRINT that has
+# to clear the bin walls (corners/edges get harder). Modeled as one massless
+# cylinder spanning flange -> suction face; a conservative envelope of the real
+# tool. PLACEHOLDER dimensions (exact tool unknown) -- edit these three lines
+# when the real gripper is known and everything downstream follows.
+GRIPPER_STANDOFF  = 0.12   # m, flange face -> suction contact plane (along tool -z)
+GRIPPER_RADIUS    = 0.05   # m, flat disc footprint radius (corner/edge clearance)
+GRIPPER_THICKNESS = 0.02   # m, body thickness used for collision (visual only here)
 
 # Base position sweep (world XYZ of the mount point). Wide search on all axes.
 BASE_X_RANGE = np.linspace(-0.70, 0.70, 11)
@@ -79,9 +111,38 @@ N_X, N_Y, N_Z = 6, 6, 4          # grid resolution of pick targets
 MARGIN = 0.06                    # keep targets this far inside the walls/floor
 
 # Tolerances
-FK_TOL        = 0.02     # m, how close the tool must actually get to the target
+FK_TOL        = 0.02     # m, how close the suction face must actually get to the target
 COLLIDE_TOL   = 0.002    # m, penetration depth that counts as a collision
-TILT_CONE_DEG = 15       # 0 = strictly tool-down; >0 lets it try angled approaches
+# A flat vacuum face must stay parallel to the ground, so the tool is strictly
+# down (TILT_CONE_DEG = 0 -> only the straight-down approach is tried). ORI_TOL_DEG
+# is slack on top of that to absorb the IK solver's small orientation residual; a
+# solution whose tool axis tilts more than TILT_CONE_DEG + ORI_TOL_DEG off vertical
+# is rejected (the suction seal would break). Raise TILT_CONE_DEG only for a tool
+# that can pick on a slope.
+TILT_CONE_DEG = 0        # 0 = strictly tool-down; >0 lets it try angled approaches
+ORI_TOL_DEG   = 3.0      # extra tool-axis slack (deg) for IK orientation residual
+
+# Skip IK entirely for targets whose flange goal is farther from the base than the
+# arm can possibly reach. Must be a SAFE UPPER BOUND on the true reach or it would
+# prune reachable targets: the measured max ||flange - base|| is 2.073 m, so 2.15 m
+# keeps all reachable goals while still skipping far corners.
+REACH_MAX     = 2.15     # m, base->flange distance above which a target is unreachable
+
+# Parallelism: the sweep is embarrassingly parallel across base poses. Each worker
+# runs its own headless PyBullet world. Set to 1 (or run with SHOW_SIM) to stay
+# single-process. Results are identical regardless of worker count.
+N_WORKERS     = os.cpu_count() or 1
+
+# Reporting: keep the top-N base poses (not just the single best) so near-ties and
+# alternative mounts are visible. The first entry is THE best (drives the plots).
+N_BEST        = 5        # how many top base poses to report and dump data for
+
+# After every run, render a reproducible animation of the best base cycling through
+# its reachable picks (offline software renderer -> GIF, no GUI needed) and dump a
+# JSON/NPZ bundle of detailed per-pick data for the top-N bases.
+SAVE_ANIMATION = True
+ANIM_W, ANIM_H = 480, 360   # animation frame size (px)
+ANIM_FPS       = 8          # frames per second in the saved GIF
 
 # IK is a numerical solver that returns ONE config per call; a 6-DOF arm usually
 # has several (elbow up/down, wrist flips). Try multiple seeds per pose and accept
@@ -167,8 +228,30 @@ def base_orientation(yaw=0.0):
 def load_robot(base_xy, height=MOUNT_HEIGHT, yaw=0.0):
     cx, cy = BIN_CENTER_XY
     pos = [cx + base_xy[0], cy + base_xy[1], height]
-    rid = p.loadURDF(ROBOT_URDF, pos, base_orientation(yaw), useFixedBase=FIXED_BASE)
+    # URDF_USE_SELF_COLLISION so the arm folding through itself is detectable;
+    # PyBullet auto-disables the parent<->child pairs that touch by design.
+    rid = p.loadURDF(ROBOT_URDF, pos, base_orientation(yaw),
+                     useFixedBase=FIXED_BASE, flags=p.URDF_USE_SELF_COLLISION)
     return rid
+
+def make_gripper():
+    """The vacuum tool as one massless cylinder spanning the flange down to the
+    suction face (a conservative envelope). Created once and teleported onto the
+    flange for each collision test in `reachable`. Axis is +z (vertical), matching
+    the strictly tool-down approach."""
+    col = p.createCollisionShape(p.GEOM_CYLINDER, radius=GRIPPER_RADIUS,
+                                 height=GRIPPER_STANDOFF)
+    vis = p.createVisualShape(p.GEOM_CYLINDER, radius=GRIPPER_RADIUS,
+                              length=GRIPPER_STANDOFF, rgbaColor=[0.1, 0.5, 1.0, 0.5])
+    # Parked far away until placed on the flange.
+    return p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col,
+                             baseVisualShapeIndex=vis, basePosition=[0, 0, -100])
+
+def place_gripper(gripper_id, flange_pos):
+    """Center the gripper cylinder between the flange and the suction face, axis
+    vertical (the tool is gated near-vertical, so a vertical cylinder is correct)."""
+    mid = [flange_pos[0], flange_pos[1], flange_pos[2] - GRIPPER_STANDOFF / 2]
+    p.resetBasePositionAndOrientation(gripper_id, mid, [0, 0, 0, 1])
 
 def movable_joints(rid):
     js = []
@@ -223,18 +306,53 @@ def ik_seeds(lo, hi):
 # ----------------------------------------------------------------------------
 # Reachability test for one target
 # ----------------------------------------------------------------------------
-def reachable(rid, bin_id, ee_link, joints, lo, hi, target, orientations, seeds):
-    """Reachable if ANY orientation has ANY collision-free, in-limits joint
-    configuration whose tool actually lands on the target. Each seed is a
-    different starting guess, so we explore the arm's multiple IK solutions
-    instead of trusting the single config one IK call happens to return."""
+def _penetrates(body_a, body_b, exclude_adjacent=False):
+    """True if any contact between the two bodies penetrates past COLLIDE_TOL.
+    With exclude_adjacent (self-collision), ignore neighbouring links in the
+    kinematic chain (|A-B|<=1), which touch by design."""
+    for c in p.getClosestPoints(body_a, body_b, distance=0.0):
+        if exclude_adjacent and abs(c[3] - c[4]) <= 1:   # c[3],c[4] = link indices
+            continue
+        if c[8] < -COLLIDE_TOL:                          # c[8] = contactDistance
+            return True
+    return False
+
+def _tool_tilt_deg(orn):
+    """Angle (deg) between the tool approach axis (link z) and straight-down."""
+    m = p.getMatrixFromQuaternion(orn)      # row-major 3x3; column 2 = link z-axis
+    tool_z = (m[2], m[5], m[8])
+    cos = max(-1.0, min(1.0, -tool_z[2]))   # dot(tool_z, world-down (0,0,-1))
+    return math.degrees(math.acos(cos))
+
+def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
+               orientations, seeds):
+    """The single source of truth for "can this target be picked from here".
+    Returns the first valid joint configuration (and its diagnostics) as a dict,
+    or None if no orientation/seed works. 'Valid' = the suction face lands on the
+    target with the tool pointing down, in joint limits, and collision-free against
+    the bin, the arm itself, and the gripper body. Each seed is a different starting
+    guess, so we explore the arm's multiple IK solutions instead of trusting the
+    single config one IK call happens to return. Checks run cheapest-first and bail
+    to the next attempt on the first failure.
+
+    Driving the animation and the data dump through this same function (rather than
+    a separate IK call) is what makes them reproducible and consistent with the
+    reported coverage."""
+    target = np.asarray(target, dtype=float)
+    # The flange sits a stand-off above the suction contact point.
+    flange_goal = target + np.array([0.0, 0.0, GRIPPER_STANDOFF])
+    base_pos = np.array(p.getBasePositionAndOrientation(rid)[0])
+    # Reach prune: if even the flange goal is beyond the arm, skip all IK.
+    if np.linalg.norm(flange_goal - base_pos) > REACH_MAX:
+        return None
+    max_tilt = TILT_CONE_DEG + ORI_TOL_DEG
     for ori in orientations:
         for seed in seeds:
             # seed both the solver's starting state and its null-space target
             for j, q in zip(joints, seed):
                 p.resetJointState(rid, j, q)
             sol = p.calculateInverseKinematics(
-                rid, ee_link, target, ori,
+                rid, ee_link, flange_goal.tolist(), ori,
                 lowerLimits=lo, upperLimits=hi,
                 jointRanges=[h - l for l, h in zip(lo, hi)],
                 restPoses=seed,
@@ -243,21 +361,42 @@ def reachable(rid, bin_id, ee_link, joints, lo, hi, target, orientations, seeds)
             # apply solution
             for j, q in zip(joints, sol):
                 p.resetJointState(rid, j, q)
-            # (1) FK check: did the tool actually reach?
-            ee_pos = p.getLinkState(rid, ee_link, computeForwardKinematics=True)[4]
-            if np.linalg.norm(np.array(ee_pos) - np.array(target)) > FK_TOL:
+            ls = p.getLinkState(rid, ee_link, computeForwardKinematics=True)
+            flange_pos, flange_orn = np.array(ls[4]), ls[5]
+            # (1) position: did the SUCTION FACE land on the target?
+            suction = flange_pos - np.array([0.0, 0.0, GRIPPER_STANDOFF])
+            fk_err = float(np.linalg.norm(suction - target))
+            if fk_err > FK_TOL:
                 continue
-            # (2) joint-limit check
+            # (2) orientation: is the flat face parallel enough to the ground?
+            tilt = _tool_tilt_deg(flange_orn)
+            if tilt > max_tilt:
+                continue
+            # (3) joint-limit check
             if any(q < l - 1e-3 or q > h + 1e-3 for q, l, h in zip(sol, lo, hi)):
                 continue
-            # (3) collision check vs the bin
-            p.performCollisionDetection()
-            pts = p.getClosestPoints(rid, bin_id, distance=0.0)
-            penetration = min([c[8] for c in pts], default=1.0)  # c[8]=contactDistance
-            if penetration < -COLLIDE_TOL:
+            # (4) arm vs bin
+            if _penetrates(rid, bin_id):
                 continue
-            return True
-    return False
+            # (5) arm vs itself
+            if _penetrates(rid, rid, exclude_adjacent=True):
+                continue
+            # (6) gripper body vs bin (corner/edge clearance + vertical descent)
+            place_gripper(gripper_id, flange_pos)
+            if _penetrates(gripper_id, bin_id):
+                continue
+            return {"joints": [float(q) for q in sol],
+                    "flange_pos": flange_pos.tolist(),
+                    "suction": suction.tolist(),
+                    "fk_err": fk_err, "tilt_deg": tilt}
+    return None
+
+def reachable(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
+              orientations, seeds):
+    """Boolean reachability -- a thin wrapper over solve_pick (which carries the
+    full logic so coverage, the data dump, and the animation never diverge)."""
+    return solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
+                      orientations, seeds) is not None
 
 # ----------------------------------------------------------------------------
 # Main sweep
@@ -268,84 +407,162 @@ def set_base(rid, base_xy, height, yaw=0.0):
     p.resetBasePositionAndOrientation(
         rid, [cx + base_xy[0], cy + base_xy[1], height], base_orientation(yaw))
 
-def run():
+# The FR20 meshes are heavy, so each process builds the world ONCE and just
+# relocates the base for every sweep point. `_W` holds the current process's world.
+_W = None
+
+def build_world():
+    """Build one PyBullet world (bin + gripper + robot) plus the cached joint and
+    IK-seed metadata. Called once per process (each parallel worker gets its own)."""
     connect()
     bin_id = make_bin()
-    targets, xs, ys, zs = bin_targets()
-    orientations = down_orientations()
-
-    # Load the robot once; the FR20 meshes are heavy, so we relocate the base
-    # for each sweep point instead of reloading the URDF every time.
+    gripper_id = make_gripper()
     rid = load_robot((0.0, 0.0), MOUNT_HEIGHT)
     joints = movable_joints(rid)
     lo, hi = joint_limits(rid, joints)
     ee = EE_LINK if EE_LINK is not None else p.getNumJoints(rid) - 1
-    seeds = ik_seeds(lo, hi)
+    return {"rid": rid, "bin_id": bin_id, "gripper_id": gripper_id,
+            "joints": joints, "lo": lo, "hi": hi, "ee": ee,
+            "seeds": ik_seeds(lo, hi), "orientations": down_orientations(),
+            "targets": bin_targets()[0]}
 
-    # coverage[iz,iy,ix] holds the BEST coverage at that XY/height over all yaws,
-    # so the heatmaps stay 2D-per-height; `best` tracks the winning yaw too.
-    coverage = np.zeros((len(BASE_Z_RANGE), len(BASE_Y_RANGE), len(BASE_X_RANGE)))
-    target_hits = np.zeros(len(targets))   # how many base poses reach each target
-    best = {"cov": -1}
+def _worker_init():
+    global _W
+    _W = build_world()
 
-    hud = hud_create() if SHOW_SIM else None
-    if SHOW_SIM:
-        print("GUI: watch the arm scan each mount position; the full sweep takes "
-              "a while, so use a smaller grid if you just want a quick look.")
-    total = (len(BASE_YAW_RANGE) * len(BASE_Z_RANGE)
-             * len(BASE_Y_RANGE) * len(BASE_X_RANGE))
-    done, t0 = 0, time.time()
-    for iyaw, byaw in enumerate(BASE_YAW_RANGE):
+def _eval_pose(args):
+    """Evaluate one base pose -> (pose_idx, reachability mask over all targets)."""
+    pose_idx, bx, by, bz, byaw = args
+    w = _W
+    set_base(w["rid"], (bx, by), bz, byaw)
+    mask = np.array([
+        reachable(w["rid"], w["bin_id"], w["gripper_id"], w["ee"], w["joints"],
+                  w["lo"], w["hi"], t, w["orientations"], w["seeds"])
+        for t in w["targets"]
+    ])
+    return pose_idx, mask
+
+def _pose_list():
+    """All base poses in nested (yaw, z, y, x) order. pose_idx is the position in
+    this list, so aggregation order -- and the result -- is independent of the
+    order in which workers happen to finish."""
+    poses, meta, idx = [], [], 0
+    for byaw in BASE_YAW_RANGE:
         for iz, bz in enumerate(BASE_Z_RANGE):
             for iy, by in enumerate(BASE_Y_RANGE):
                 for ix, bx in enumerate(BASE_X_RANGE):
-                    set_base(rid, (bx, by), bz, byaw)
-                    mask = np.array([
-                        reachable(rid, bin_id, ee, joints, lo, hi, t,
-                                  orientations, seeds)
-                        for t in targets
-                    ])
-                    cov = mask.mean()
-                    coverage[iz, iy, ix] = max(coverage[iz, iy, ix], cov)
-                    target_hits += mask
-                    if cov > best["cov"]:
-                        best = {"cov": cov, "xy": (bx, by), "z": bz,
-                                "yaw": byaw, "mask": mask}
+                    poses.append((idx, bx, by, bz, byaw))
+                    meta.append((iz, iy, ix, bx, by, bz, byaw))
+                    idx += 1
+    return poses, meta
+
+def _aggregate(targets, meta, results):
+    """Fold per-pose masks into coverage / target_hits / ranked bests, all
+    deterministically in pose order. coverage[iz,iy,ix] keeps the BEST coverage over
+    all yaws at that XY/height. `bests` is the top-N base poses by coverage, ties
+    broken by earliest pose (matching the serial run); bests[0] is THE best."""
+    coverage = np.zeros((len(BASE_Z_RANGE), len(BASE_Y_RANGE), len(BASE_X_RANGE)))
+    target_hits = np.zeros(len(targets))
+    ranked = []
+    for idx in range(len(meta)):
+        mask = results[idx]
+        iz, iy, ix, bx, by, bz, byaw = meta[idx]
+        cov = float(mask.mean())
+        coverage[iz, iy, ix] = max(coverage[iz, iy, ix], cov)
+        target_hits += mask
+        ranked.append((cov, idx, bx, by, bz, byaw, mask))
+    # sort by coverage desc, then pose index asc (deterministic tie-break)
+    ranked.sort(key=lambda r: (-r[0], r[1]))
+    bests = [{"cov": cov, "xy": (bx, by), "z": bz, "yaw": byaw, "mask": mask}
+             for cov, idx, bx, by, bz, byaw, mask in ranked[:max(N_BEST, 1)]]
+    return coverage, target_hits, bests
+
+def _sweep_gui(targets, poses, meta, total):
+    """Single-process sweep with the live GUI/HUD (a shared GUI can't be driven
+    from worker processes). Settles the arm on a reachable pick at each base so the
+    scan is watchable, then aggregates the same way as the headless paths."""
+    global _W
+    _W = build_world()
+    hud = hud_create()
+    print("GUI: watch the arm scan each mount position; the full sweep takes "
+          "a while, so use a smaller grid if you just want a quick look.")
+    results, t0, done, best = {}, time.time(), 0, {"cov": -1}
+    for ps in poses:
+        pose_idx, mask = _eval_pose(ps)
+        results[pose_idx] = mask
+        _, bx, by, bz, byaw = ps
+        cov = mask.mean()
+        if cov > best["cov"]:
+            best = {"cov": cov, "xy": (bx, by), "z": bz, "yaw": byaw}
+        done += 1
+        progress_bar(done, total, t0)
+        reach_pts = targets[mask]
+        if len(reach_pts):
+            pose_at(_W["rid"], _W["ee"], _W["joints"], _W["lo"], _W["hi"],
+                    reach_pts[len(reach_pts) // 2], _W["orientations"],
+                    _W["gripper_id"])
+        elapsed = time.time() - t0
+        eta = elapsed / done * (total - done)
+        hud_update(hud, [
+            "FR20 bin reachability  -  SWEEP",
+            f"base   x={bx:+.2f}  y={by:+.2f}  z={bz:.2f} m  "
+            f"yaw={math.degrees(byaw):+.0f}deg",
+            f"coverage here:   {cov*100:4.1f}%   "
+            f"({int(mask.sum())}/{len(targets)} picks)",
+            f"best so far:   {best['cov']*100:4.1f}%   "
+            f"@ x={best['xy'][0]:+.2f} y={best['xy'][1]:+.2f} "
+            f"z={best['z']:.2f} yaw={math.degrees(best['yaw']):+.0f}",
+            f"progress:   {done}/{total}  ({done/total*100:4.1f}%)",
+            f"elapsed {_fmt_mmss(elapsed)}    eta {_fmt_mmss(eta)}",
+        ])
+        time.sleep(SIM_DWELL)
+    coverage, target_hits, bests = _aggregate(targets, meta, results)
+    return coverage, target_hits, bests, hud
+
+def run():
+    # Each run writes its diagrams to out/run_<timestamp>/ so results don't clobber.
+    global RUN_DIR, _W
+    RUN_DIR = os.path.join(OUT_DIR, time.strftime("run_%Y%m%d_%H%M%S"))
+    targets, xs, ys, zs = bin_targets()
+    poses, meta = _pose_list()
+    total = len(poses)
+    hud = None
+
+    if SHOW_SIM:
+        coverage, target_hits, bests, hud = _sweep_gui(targets, poses, meta, total)
+    else:
+        results, t0, done = {}, time.time(), 0
+        if N_WORKERS and N_WORKERS > 1:
+            print(f"Sweeping {total} base poses x {len(targets)} targets "
+                  f"on {N_WORKERS} workers...")
+            with mp.Pool(N_WORKERS, initializer=_worker_init) as pool:
+                for pose_idx, mask in pool.imap_unordered(_eval_pose, poses):
+                    results[pose_idx] = mask
                     done += 1
                     progress_bar(done, total, t0)
-                    if SHOW_SIM:
-                        # settle the arm on a reachable pick so the scan is watchable
-                        reach_pts = targets[mask]
-                        if len(reach_pts):
-                            pose_at(rid, ee, joints, lo, hi,
-                                    reach_pts[len(reach_pts) // 2], orientations)
-                        elapsed = time.time() - t0
-                        eta = elapsed / done * (total - done)
-                        hud_update(hud, [
-                            "FR20 bin reachability  -  SWEEP",
-                            f"base   x={bx:+.2f}  y={by:+.2f}  z={bz:.2f} m  "
-                            f"yaw={math.degrees(byaw):+.0f}deg",
-                            f"coverage here:   {cov*100:4.1f}%   "
-                            f"({int(mask.sum())}/{len(targets)} picks)",
-                            f"best so far:   {best['cov']*100:4.1f}%   "
-                            f"@ x={best['xy'][0]:+.2f} y={best['xy'][1]:+.2f} "
-                            f"z={best['z']:.2f} yaw={math.degrees(best['yaw']):+.0f}",
-                            f"progress:   {done}/{total}  ({done/total*100:4.1f}%)",
-                            f"elapsed {_fmt_mmss(elapsed)}    eta {_fmt_mmss(eta)}",
-                        ])
-                        time.sleep(SIM_DWELL)
+        else:
+            _worker_init()
+            for ps in poses:
+                pose_idx, mask = _eval_pose(ps)
+                results[pose_idx] = mask
+                done += 1
+                progress_bar(done, total, t0)
+        coverage, target_hits, bests = _aggregate(targets, meta, results)
+
+    best = bests[0]
     target_freq = target_hits / total      # fraction of bases reaching each target
 
-    print(f"\nBest base offset: x={best['xy'][0]:+.3f} m, "
-          f"y={best['xy'][1]:+.3f} m, z={best['z']:.3f} m, "
-          f"yaw={math.degrees(best['yaw']):+.1f} deg  ->  "
-          f"coverage {best['cov']*100:.1f}%")
+    print(f"\nTop {len(bests)} base poses by coverage:")
+    for r, b in enumerate(bests, 1):
+        print(f"  #{r}: x={b['xy'][0]:+.3f} y={b['xy'][1]:+.3f} z={b['z']:.3f} m  "
+              f"yaw={math.degrees(b['yaw']):+5.1f} deg  ->  {b['cov']*100:5.1f}%  "
+              f"({int(b['mask'].sum())}/{len(targets)})")
     print(f"Heights tried: {[round(float(z), 3) for z in BASE_Z_RANGE]} m | "
           f"yaws tried: {[round(math.degrees(y), 1) for y in BASE_YAW_RANGE]} deg | "
           f"targets evaluated: {len(targets)}")
 
     # --- diagrams ---
-    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(RUN_DIR, exist_ok=True)
     saved = [
         plot_coverage_grid(coverage, best),
         plot_best_slices(best, xs, ys, zs),
@@ -353,13 +570,25 @@ def run():
         plot_coverage_vs_height(coverage),
         plot_target_frequency(target_freq, xs, ys, zs),
     ]
-    print(f"Saved {len(saved)} diagrams to {OUT_DIR}:")
+
+    # --- reproducible end animation + detailed data on the top-N bases ---
+    # Needs a world in THIS process. SHOW_SIM already has one (_W); the parallel
+    # path leaves the parent worldless, so build one here.
+    if _W is None:
+        _worker_init()
+    saved.append(dump_best_data(_W, bests, targets, coverage, target_freq))
+    if SAVE_ANIMATION:
+        saved.append(render_animation(_W, best, targets))
+
+    print(f"Saved {len(saved)} artifacts to {RUN_DIR}:")
     for pth in saved:
         print(f"  - {os.path.basename(pth)}")
 
     # --- optional: watch the arm work the best base in the GUI ---
     if SHOW_SIM:
-        visualize_best(rid, ee, joints, lo, hi, targets, orientations, best, hud)
+        visualize_best(_W["rid"], _W["ee"], _W["joints"], _W["lo"], _W["hi"],
+                       targets, _W["orientations"], best, hud, _W["gripper_id"])
+    return bests
 
 # ----------------------------------------------------------------------------
 # Diagrams
@@ -414,7 +643,7 @@ def plot_coverage_grid(coverage, best):
                  f"z={best['z']:.2f} m, yaw={math.degrees(best['yaw']):+.0f}deg  ->  "
                  f"{best['cov']*100:.1f}%   (dashed = bin footprint)", fontsize=11)
     fig.colorbar(im, ax=axes.ravel().tolist(), label="coverage %")
-    path = os.path.join(OUT_DIR, "coverage_vs_base.png")
+    path = os.path.join(RUN_DIR, "coverage_vs_base.png")
     fig.savefig(path, dpi=130)
     plt.close(fig)
     return path
@@ -445,7 +674,7 @@ def plot_best_slices(best, xs, ys, zs):
                  f"z={best['z']:.2f} m, yaw={math.degrees(best['yaw']):+.0f}deg)   "
                  f"green = reachable, red = not", fontsize=11)
     fig.tight_layout()
-    path = os.path.join(OUT_DIR, "best_pos_slices.png")
+    path = os.path.join(RUN_DIR, "best_pos_slices.png")
     fig.savefig(path, dpi=130)
     plt.close(fig)
     return path
@@ -483,7 +712,7 @@ def plot_reach_3d(best, targets):
                  f"({best['cov']*100:.1f}% coverage)")
     ax.legend(loc="upper left", fontsize=8)
     ax.view_init(elev=22, azim=-60)
-    path = os.path.join(OUT_DIR, "reach_3d.png")
+    path = os.path.join(RUN_DIR, "reach_3d.png")
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -506,7 +735,7 @@ def plot_coverage_vs_height(coverage):
     ax.set_xlabel("mount height z (m)"); ax.set_ylabel("coverage %")
     ax.set_title("Coverage vs. mount height")
     ax.grid(True, alpha=0.3); ax.legend()
-    path = os.path.join(OUT_DIR, "coverage_vs_height.png")
+    path = os.path.join(RUN_DIR, "coverage_vs_height.png")
     fig.tight_layout()
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -536,9 +765,148 @@ def plot_target_frequency(target_freq, xs, ys, zs):
     fig.suptitle("Target reachability across ALL base positions "
                  "(% of swept bases that can reach each point)", fontsize=11)
     fig.colorbar(im, ax=axes.ravel().tolist(), label="% of bases")
-    path = os.path.join(OUT_DIR, "target_reachability.png")
+    path = os.path.join(RUN_DIR, "target_reachability.png")
     fig.savefig(path, dpi=130)
     plt.close(fig)
+    return path
+
+# ----------------------------------------------------------------------------
+# Detailed data dump + reproducible end animation (run after every sweep)
+# ----------------------------------------------------------------------------
+def _pick_records(world, base, targets):
+    """Per-target detail for one base pose: reachable flag and, when reachable, the
+    joint solution / FK error / tool tilt. Re-solved with solve_pick (the same
+    deterministic logic as the sweep) so the records match the reported coverage."""
+    set_base(world["rid"], base["xy"], base["z"], base["yaw"])
+    recs = []
+    for t in targets:
+        sol = solve_pick(world["rid"], world["bin_id"], world["gripper_id"],
+                         world["ee"], world["joints"], world["lo"], world["hi"],
+                         t, world["orientations"], world["seeds"])
+        rec = {"target_m": [round(float(v), 4) for v in t],
+               "reachable": sol is not None}
+        if sol is not None:
+            rec["joints_rad"] = [round(q, 5) for q in sol["joints"]]
+            rec["joints_deg"] = [round(math.degrees(q), 2) for q in sol["joints"]]
+            rec["fk_err_mm"] = round(sol["fk_err"] * 1000, 2)
+            rec["tool_tilt_deg"] = round(sol["tilt_deg"], 2)
+        recs.append(rec)
+    return recs
+
+def dump_best_data(world, bests, targets, coverage, target_freq):
+    """Write a detailed, reproducible bundle on the top-N base poses:
+      best_versions.json -- config, per-base summaries, per-depth counts, and the
+                            joint solution / FK error / tool tilt for every pick;
+      best_versions.npz  -- raw arrays (coverage grid, target frequency, and per
+                            best the reach mask + joint configs, NaN where blocked).
+    """
+    os.makedirs(RUN_DIR, exist_ok=True)
+    zs = np.linspace(MARGIN, BIN_DEPTH - MARGIN, N_Z)
+    total_poses = (len(BASE_X_RANGE) * len(BASE_Y_RANGE)
+                   * len(BASE_Z_RANGE) * len(BASE_YAW_RANGE))
+    config = {
+        "robot_urdf": os.path.basename(ROBOT_URDF),
+        "bin_LxWxD_m": [BIN_L, BIN_W, BIN_DEPTH],
+        "gripper": {"standoff_m": GRIPPER_STANDOFF, "radius_m": GRIPPER_RADIUS,
+                    "thickness_m": GRIPPER_THICKNESS, "note": "placeholder dims"},
+        "tolerances": {"fk_tol_m": FK_TOL, "collide_tol_m": COLLIDE_TOL,
+                       "tilt_cone_deg": TILT_CONE_DEG, "ori_tol_deg": ORI_TOL_DEG,
+                       "reach_max_m": REACH_MAX},
+        "target_grid": {"nx": N_X, "ny": N_Y, "nz": N_Z, "margin_m": MARGIN},
+        "base_sweep": {"x": [round(float(v), 4) for v in BASE_X_RANGE],
+                       "y": [round(float(v), 4) for v in BASE_Y_RANGE],
+                       "z": [round(float(v), 4) for v in BASE_Z_RANGE],
+                       "yaw_deg": [round(math.degrees(v), 1) for v in BASE_YAW_RANGE]},
+        "n_ik_seeds": N_IK_SEEDS, "n_workers": N_WORKERS,
+    }
+    blocks, npz = [], {"coverage": coverage,
+                       "target_freq": target_freq.reshape(N_Z, N_Y, N_X),
+                       "targets_m": targets}
+    for r, b in enumerate(bests, 1):
+        recs = _pick_records(world, b, targets)
+        mask3 = b["mask"].reshape(N_Z, N_Y, N_X)
+        per_depth = [{"z_m": round(float(zs[k]), 3),
+                      "reachable": int(mask3[k].sum()),
+                      "total": int(mask3[k].size),
+                      "pct": round(float(mask3[k].mean()) * 100, 1)}
+                     for k in range(N_Z)]
+        blocks.append({
+            "rank": r,
+            "base": {"x": round(float(b["xy"][0]), 4),
+                     "y": round(float(b["xy"][1]), 4),
+                     "z": round(float(b["z"]), 4),
+                     "yaw_deg": round(math.degrees(b["yaw"]), 2)},
+            "coverage_pct": round(b["cov"] * 100, 2),
+            "reachable": int(b["mask"].sum()), "total": int(b["mask"].size),
+            "per_depth": per_depth,
+            "picks": recs,
+        })
+        jc = np.full((len(targets), len(world["joints"])), np.nan)
+        for i, rec in enumerate(recs):
+            if rec["reachable"]:
+                jc[i] = rec["joints_rad"]
+        npz[f"best{r}_mask"] = b["mask"]
+        npz[f"best{r}_joints_rad"] = jc
+    bundle = {
+        "config": config,
+        "summary": {"total_base_poses": total_poses, "total_targets": len(targets),
+                    "n_best_reported": len(bests)},
+        "bests": blocks,
+    }
+    jpath = os.path.join(RUN_DIR, "best_versions.json")
+    with open(jpath, "w") as f:
+        json.dump(bundle, f, indent=2)
+    np.savez_compressed(os.path.join(RUN_DIR, "best_versions.npz"), **npz)
+    return jpath
+
+def _add_target_markers(targets, mask):
+    """Visual-only spheres (green=reachable, red=not) so they show up in the
+    rendered animation (debug points/lines are not captured by getCameraImage)."""
+    ids = []
+    for t, ok in zip(targets, mask):
+        color = [0.1, 0.9, 0.2, 1] if ok else [0.9, 0.15, 0.15, 1]
+        vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.018, rgbaColor=color)
+        ids.append(p.createMultiBody(baseMass=0, baseCollisionShapeIndex=-1,
+                                     baseVisualShapeIndex=vis,
+                                     basePosition=[float(t[0]), float(t[1]),
+                                                   float(t[2])]))
+    return ids
+
+def render_animation(world, best, targets):
+    """Reproducible end animation: at the best base, drive the arm through its
+    reachable picks with the offline software renderer and save a GIF -- no GUI
+    needed, so it is produced after every run and is identical each time."""
+    os.makedirs(RUN_DIR, exist_ok=True)
+    rid = world["rid"]
+    set_base(rid, best["xy"], best["z"], best["yaw"])
+    _add_target_markers(targets, best["mask"])
+    reach_pts = targets[best["mask"]]
+    view = p.computeViewMatrixFromYawPitchRoll(
+        [BIN_CENTER_XY[0], BIN_CENTER_XY[1], BIN_DEPTH / 2], 2.9, 50, -35, 0, 2)
+    proj = p.computeProjectionMatrixFOV(60, ANIM_W / ANIM_H, 0.1, 10)
+
+    def frame():
+        img = p.getCameraImage(ANIM_W, ANIM_H, view, proj,
+                               renderer=p.ER_TINY_RENDERER)
+        rgb = np.reshape(img[2], (ANIM_H, ANIM_W, 4))[:, :, :3].astype(np.uint8)
+        return Image.fromarray(rgb)
+
+    frames = []
+    for t in reach_pts:
+        sol = solve_pick(rid, world["bin_id"], world["gripper_id"], world["ee"],
+                         world["joints"], world["lo"], world["hi"], t,
+                         world["orientations"], world["seeds"])
+        if sol is None:                      # consistent with the mask; shouldn't fire
+            continue
+        for j, q in zip(world["joints"], sol["joints"]):
+            p.resetJointState(rid, j, q)
+        place_gripper(world["gripper_id"], np.array(sol["flange_pos"]))
+        frames.append(frame())
+    path = os.path.join(RUN_DIR, "best_pick_cycle.gif")
+    if not frames:                           # no reachable picks -> still emit a frame
+        frames = [frame()]
+    frames[0].save(path, save_all=True, append_images=frames[1:],
+                   duration=int(1000 / max(ANIM_FPS, 1)), loop=0)
     return path
 
 HUD_COLOR = [0.15, 1.0, 0.35]   # on-screen text color
@@ -563,25 +931,32 @@ def hud_update(ids, lines):
         ids[i] = p.addUserDebugText(txt, _hud_anchor(i), textColorRGB=HUD_COLOR,
                                     textSize=HUD_SIZE, replaceItemUniqueId=ids[i])
 
-def pose_at(rid, ee, joints, lo, hi, target, orientations):
-    """Drive the arm to `target` with the tool pointing down. Returns True if
-    forward kinematics confirms it reached (within FK_TOL)."""
-    target = list(target)
+def pose_at(rid, ee, joints, lo, hi, target, orientations, gripper_id=None):
+    """Drive the arm so the suction face lands on `target` (tool pointing down) and
+    place the gripper body if one is given. Returns True if the face reached within
+    FK_TOL. The flange is commanded a stand-off above the contact point."""
+    target = np.asarray(target, dtype=float)
+    flange_goal = (target + np.array([0.0, 0.0, GRIPPER_STANDOFF])).tolist()
     for ori in orientations:
         sol = p.calculateInverseKinematics(
-            rid, ee, target, ori,
+            rid, ee, flange_goal, ori,
             lowerLimits=lo, upperLimits=hi,
             jointRanges=[h - l for l, h in zip(lo, hi)],
             restPoses=[(l + h) / 2 for l, h in zip(lo, hi)],
             maxNumIterations=200, residualThreshold=1e-4)
         for j, q in zip(joints, sol):
             p.resetJointState(rid, j, q)
-        ee_pos = p.getLinkState(rid, ee, computeForwardKinematics=True)[4]
-        if np.linalg.norm(np.array(ee_pos) - np.array(target)) <= FK_TOL:
+        flange_pos = np.array(
+            p.getLinkState(rid, ee, computeForwardKinematics=True)[4])
+        if gripper_id is not None:
+            place_gripper(gripper_id, flange_pos)
+        suction = flange_pos - np.array([0.0, 0.0, GRIPPER_STANDOFF])
+        if np.linalg.norm(suction - target) <= FK_TOL:
             return True
     return False
 
-def visualize_best(rid, ee, joints, lo, hi, targets, orientations, best, hud=None):
+def visualize_best(rid, ee, joints, lo, hi, targets, orientations, best, hud=None,
+                   gripper_id=None):
     """At the best base, mark every target (green=reachable, red=not) and
     drive the arm through the reachable points so you can watch it work."""
     set_base(rid, best["xy"], best["z"], best["yaw"])
@@ -599,7 +974,7 @@ def visualize_best(rid, ee, joints, lo, hi, targets, orientations, best, hud=Non
     try:
         while p.isConnected():
             for i, t in enumerate(reach_pts):
-                pose_at(rid, ee, joints, lo, hi, t, orientations)
+                pose_at(rid, ee, joints, lo, hi, t, orientations, gripper_id)
                 hud_update(hud, [
                     "FR20 bin reachability  -  BEST BASE",
                     f"base   x={best['xy'][0]:+.2f}  y={best['xy'][1]:+.2f}  "
