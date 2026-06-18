@@ -129,10 +129,10 @@ The reachability core:
 
 ## Performance
 
-Full default sweep (5324 poses × 144 targets): ~**16–19 min** on 12 cores (~3 h
-single-process) with the two `TOOL_YAW_DEG` clockings — ~2.1 s/pose. Scales with core
-count and with the clocking count (each clocking is a separate IK attempt; one clocking
-was ~0.96 s/pose ≈ 7–9 min; `USE_GRIPPER = False` collapses to one clocking too). The
+Full default sweep (5324 poses × 600 targets): ~**65–80 min** on 12 cores (~13 h
+single-process) with the two `TOOL_YAW_DEG` clockings — ~8.8 s/pose. Scales linearly
+with the target count (`N_X·N_Y·N_Z`, raised from 144 to 600), the clocking count (each
+is a separate IK attempt; `USE_GRIPPER = False` collapses to one), and `N_IK_SEEDS`. The
 dump re-solves every target for each of the `N_BEST` + `N_DIVERSE` poses, and the
 animation renders one frame per reachable pick — together ~15–40 s; trim via
 `SAVE_ANIMATION` / `N_BEST` / `N_DIVERSE` if needed.

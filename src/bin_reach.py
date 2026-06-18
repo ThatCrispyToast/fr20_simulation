@@ -135,8 +135,10 @@ BASE_Z_RANGE = MOUNT_HEIGHT + np.linspace(-0.40, 0.40, 11)  # mount heights to t
 # headings. Set to [0.0] to disable the yaw search.
 BASE_YAW_RANGE = np.deg2rad(np.linspace(0.0, 90.0, 4))   # [0, 30, 60, 90] deg
 
-# Target sampling inside the bin
-N_X, N_Y, N_Z = 6, 6, 4          # grid resolution of pick targets
+# Target sampling inside the bin. Finer = sharper reachability map but the sweep cost
+# scales linearly with the point count (N_X*N_Y*N_Z). 10x10x6 = 600 points (~0.11 m
+# spacing); was 6x6x4 = 144. Runtime grows ~proportionally (so ~4x vs the old grid).
+N_X, N_Y, N_Z = 10, 10, 6        # grid resolution of pick targets (600 points)
 MARGIN = 0.06                    # keep targets this far inside the walls/floor
 
 # Tolerances

@@ -29,7 +29,7 @@ uv run python src/bin_reach.py
 ```
 
 The default sweep is wide on all axes — `11 (x) × 11 (y) × 11 (z) × 4 (yaw) =
-5324` mount poses, each tested against `6 × 6 × 4 = 144` pick targets. The yaw
+5324` mount poses, each tested against `10 × 10 × 6 = 600` pick targets. The yaw
 axis rotates the base about the vertical: the arm's reachable envelope is not
 axisymmetric over a rectangular bin (joint 1 has a ~±175° dead wedge and the
 shoulder/elbow offset clears the walls differently per heading), so heading
@@ -39,12 +39,12 @@ is checked with multiple IK seeds (see below).
 
 The sweep runs in parallel across `N_WORKERS` processes (default = all cores), each
 its own headless PyBullet world; results are identical regardless of worker count.
-On a 12-core machine the full default sweep takes **~16–19 minutes** (~3 h
-single-process); it scales with core count and with the number of `TOOL_YAW_DEG`
-clockings (each is a separate IK attempt). The progress bar shows elapsed time and
-ETA. For quicker iteration, shrink the `BASE_*_RANGE` arrays (set
-`BASE_YAW_RANGE = [0.0]` to disable the yaw search), drop a `TOOL_YAW_DEG` clocking,
-or lower `N_IK_SEEDS`.
+On a 12-core machine the full default sweep takes **~65–80 minutes** with the
+`10 × 10 × 6 = 600` target grid; it scales linearly with the target count
+(`N_X·N_Y·N_Z`), the number of `TOOL_YAW_DEG` clockings, and `N_IK_SEEDS`, and inversely
+with core count. The progress bar shows elapsed time and ETA. For quicker iteration,
+shrink the `BASE_*_RANGE` arrays (set `BASE_YAW_RANGE = [0.0]` to disable the yaw
+search), lower `N_X/N_Y/N_Z`, drop a `TOOL_YAW_DEG` clocking, or lower `N_IK_SEEDS`.
 
 ### The vacuum gripper
 
@@ -88,8 +88,8 @@ target that *is* reachable can look blocked if that single config happens to
 collide or exceed a joint limit. `N_IK_SEEDS` controls how many seeded IK
 attempts are made per pose; a target counts as reachable if **any** seed yields a
 collision-free, in-limits configuration that lands on it. More seeds = fewer
-false negatives, proportionally slower (e.g. on a central base, the 8-seed default
-finds ~71/144 targets — coverage is a lower bound that rises with more seeds).
+false negatives, proportionally slower — coverage is a lower bound that rises (a
+little) with more seeds.
 
 ### Outputs
 
