@@ -9,7 +9,8 @@ and prints a terminal progress bar.
 A pick counts as reachable only if some IK solution lands the suction face on the
 target with the tool pointing straight down, in joint limits, and collision-free —
 checked against the bin walls, the arm against **itself**, and the **gripper body**
-against the walls (so corner/edge picks the disc can't fit are correctly excluded).
+against the walls (so near-wall picks the 400×280 plate can't fit are correctly
+excluded — for which the tool is clocked to whichever rotation fits best).
 
 ## Setup
 
@@ -38,19 +39,29 @@ is checked with multiple IK seeds (see below).
 
 The sweep runs in parallel across `N_WORKERS` processes (default = all cores), each
 its own headless PyBullet world; results are identical regardless of worker count.
-The progress bar shows elapsed time and ETA. For quicker iteration, shrink the
-`BASE_*_RANGE` arrays (set `BASE_YAW_RANGE = [0.0]` to disable the yaw search) or
-lower `N_IK_SEEDS`.
+On a 12-core machine the full default sweep takes **~16–19 minutes** (~3 h
+single-process); it scales with core count and with the number of `TOOL_YAW_DEG`
+clockings (each is a separate IK attempt). The progress bar shows elapsed time and
+ETA. For quicker iteration, shrink the `BASE_*_RANGE` arrays (set
+`BASE_YAW_RANGE = [0.0]` to disable the yaw search), drop a `TOOL_YAW_DEG` clocking,
+or lower `N_IK_SEEDS`.
 
 ### The vacuum gripper
 
-The end effector is modeled as a flat vacuum gripper whose face stays parallel to
-the ground, so the tool is **strictly down** (`TILT_CONE_DEG = 0`; `ORI_TOL_DEG` is
-slack for the IK orientation residual). The tool is a `GRIPPER_STANDOFF` offset from
-the flange to the suction face (the arm reaches deeper) plus a flat disc of radius
-`GRIPPER_RADIUS` that must clear the walls. **These three lines in `CONFIG` are
-placeholders** — the real tool's dimensions are unknown; edit them in one place when
-known and the IK target, collision checks, and plots all follow.
+The end effector is a **Schmalz FQE/FXCB 400×280 vacuum gripper for cobots** (ISO
+9409-1 flange, mounts directly on the FR20). Its foam face stays parallel to the
+ground, so the tool is **strictly down** (`TILT_CONE_DEG = 0`; `ORI_TOL_DEG` is slack
+for the IK orientation residual). It's modeled as a conservative **box envelope**:
+`GRIPPER_LENGTH × GRIPPER_WIDTH` footprint (400 × 280 mm) spanning a `GRIPPER_STANDOFF`
+from the flange down to the foam face. Because the plate is large and rectangular, a
+pick near a wall only fits at some **clockings** — the tool is rotated about the
+vertical through `TOOL_YAW_DEG` (0° and 90°) and a target counts if it fits at any of
+them. You don't need the manufacturer's CAD/URDF files; just these CONFIG numbers.
+
+> The 400 × 280 footprint is from the Schmalz datasheet. The **stand-off** (flange →
+> foam face, `GRIPPER_STANDOFF = 0.12 m`) is an **estimate** — the exact height is only
+> in the downloadable STEP/2D drawing behind the retailer; replace it with the real
+> value (a one-line edit) when you have it.
 
 ### Why multiple IK seeds
 
@@ -97,19 +108,21 @@ pose).
 
 Everything is in the `CONFIG` block of [src/bin_reach.py](src/bin_reach.py):
 bin dimensions, `MOUNT_HEIGHT`, the `BASE_*_RANGE` sweeps, target grid
-resolution, the gripper dimensions (`GRIPPER_STANDOFF` / `GRIPPER_RADIUS` /
-`GRIPPER_THICKNESS`), `N_WORKERS`, `N_BEST` (how many top poses to report and dump),
-the animation settings (`SAVE_ANIMATION`, `ANIM_W/H`, `ANIM_FPS`), and tolerances.
-Narrow the `BASE_*_RANGE` arrays or drop their point counts for a faster run; raise
-`N_WORKERS` to use more cores (default = all of them).
+resolution, the gripper dimensions (`GRIPPER_LENGTH` / `GRIPPER_WIDTH` /
+`GRIPPER_STANDOFF` and `TOOL_YAW_DEG`), `N_WORKERS`, `N_BEST` (how many top poses to
+report and dump), the animation settings (`SAVE_ANIMATION`, `ANIM_W/H`, `ANIM_FPS`),
+and tolerances. Narrow the `BASE_*_RANGE` arrays or drop their point counts (or the
+`TOOL_YAW_DEG` clockings) for a faster run; raise `N_WORKERS` to use more cores
+(default = all of them).
 
 ### Known limitations
 
 - **Goal-pose only.** Each pick is checked as a static configuration. The gripper's
-  own vertical descent is covered (vertical walls + a horizontal disc at fixed XY),
+  own vertical descent is covered (vertical walls + a horizontal plate at fixed XY),
   but a full collision-free *arm trajectory* into the bin is not planned — coverage
   is an upper bound on what a real motion planner would achieve.
 - **Coverage is a lower bound.** Numerical IK with finite seeds yields occasional
   false negatives; the reported percentages rise slightly with `N_IK_SEEDS`.
-- **Placeholder gripper.** Until the real tool's dimensions are filled in, absolute
-  numbers near walls/corners depend on the placeholder footprint.
+- **Estimated stand-off.** The 400 × 280 footprint is from the datasheet, but the
+  flange→foam height is estimated (`GRIPPER_STANDOFF = 0.12 m`); it shifts depth
+  reach by a few cm. Footprint, not stand-off, dominates the near-wall results.

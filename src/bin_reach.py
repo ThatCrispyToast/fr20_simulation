@@ -5,9 +5,10 @@ What it does
 ------------
 - Builds a deep bin (floor + 4 walls) from box collision shapes.
 - Mounts a robot arm overhead, hanging down over the bin.
-- Models the end effector as a flat vacuum gripper (face parallel to the ground,
-  picks straight down): a stand-off from the flange to the suction face plus a flat
-  footprint that has to clear the walls.
+- Models the end effector as a Schmalz FQE/FXCB 400x280 flat vacuum gripper (face
+  parallel to the ground, picks straight down): a stand-off from the flange to the
+  foam face plus a large rectangular footprint that has to clear the walls. The
+  plate is clocked about the vertical (TOOL_YAW_DEG) so it can be rotated to fit.
 - Sweeps a grid of base XYZ positions and headings (yaw).
 - For each base pose, samples a 3D grid of target points inside the bin and counts a
   target as REACHABLE only if some IK solution (over several seeds) satisfies ALL of:
@@ -32,9 +33,9 @@ single-process run. Set SHOW_SIM=True to watch it (forces a single process).
 Swap in your own robot / gripper
 --------------------------------
 Set ROBOT_URDF to your arm's URDF and adjust EE_LINK (or leave None to auto-pick the
-last link). Edit the gripper dimensions (GRIPPER_STANDOFF / RADIUS / THICKNESS) to
-match your tool. Set the bin dimensions and the base sweep to match your cell.
-Everything you'll touch is in the CONFIG block.
+last link). Edit the gripper dimensions (GRIPPER_LENGTH / WIDTH / STANDOFF, and
+TOOL_YAW_DEG) to match your tool. Set the bin dimensions and the base sweep to match
+your cell. Everything you'll touch is in the CONFIG block.
 """
 
 import os
@@ -82,16 +83,27 @@ FLIP_BASE = True         # rotate base 180deg about X so the arm hangs down
 # ----------------------------------------------------------------------------
 # Vacuum gripper -- SWAP YOUR TOOL HERE
 # ----------------------------------------------------------------------------
-# A flat vacuum gripper whose suction face stays parallel to the ground and picks
-# straight down. The tool adds a STAND-OFF (the flange sits this far above the
-# suction contact point, so the arm reaches deeper) and a flat FOOTPRINT that has
-# to clear the bin walls (corners/edges get harder). Modeled as one massless
-# cylinder spanning flange -> suction face; a conservative envelope of the real
-# tool. PLACEHOLDER dimensions (exact tool unknown) -- edit these three lines
-# when the real gripper is known and everything downstream follows.
-GRIPPER_STANDOFF  = 0.12   # m, flange face -> suction contact plane (along tool -z)
-GRIPPER_RADIUS    = 0.05   # m, flat disc footprint radius (corner/edge clearance)
-GRIPPER_THICKNESS = 0.02   # m, body thickness used for collision (visual only here)
+# Schmalz FQE/FXCB area vacuum gripper for cobots, 400 x 280 (ISO 9409-1 flange,
+# fits the FR20 directly). Flat foam suction face stays parallel to the ground and
+# picks straight down. The tool adds a STAND-OFF (the flange sits this far above the
+# foam face, so the arm reaches deeper) and a large rectangular FOOTPRINT that has
+# to clear the bin walls -- a 400x280 plate cannot pick close to a wall, so its
+# clocking about the vertical matters (see TOOL_YAW_DEG). Modeled as one massless
+# box spanning flange -> foam face: a conservative envelope (treats the whole body
+# as the full plate footprint). Edit these to swap tools; everything downstream
+# follows.
+#   Footprint 400 x 280 mm is from the Schmalz datasheet (confirmed).
+#   STAND-OFF is an ESTIMATE: the flange->foam height is only in the STEP/2D
+#   drawing behind the retailer (Devonics/Inlux); replace 0.12 with the real value.
+GRIPPER_LENGTH    = 0.400   # m, footprint long side  (tool-frame x)
+GRIPPER_WIDTH     = 0.280   # m, footprint short side (tool-frame y)
+GRIPPER_STANDOFF  = 0.12    # m, flange face -> foam suction face (ESTIMATE; see above)
+
+# Clockings (deg, about the vertical) of the rectangular footprint to try. A pick
+# counts if the plate fits at ANY clocking, so the arm is free to rotate the tool
+# to fit. 0 puts the long side along world x, 90 along world y; the rectangle is
+# 180-symmetric so 0..90 covers the distinct fits in an axis-aligned bin.
+TOOL_YAW_DEG      = (0.0, 90.0)
 
 # Base position sweep (world XYZ of the mount point). Wide search on all axes.
 BASE_X_RANGE = np.linspace(-0.70, 0.70, 11)
@@ -132,6 +144,7 @@ REACH_MAX     = 2.15     # m, base->flange distance above which a target is unre
 # runs its own headless PyBullet world. Set to 1 (or run with SHOW_SIM) to stay
 # single-process. Results are identical regardless of worker count.
 N_WORKERS     = os.cpu_count() or 1
+if N_WORKERS == 1: print("!! RUNNING SINGLE THREADED !!")
 
 # Reporting: keep the top-N base poses (not just the single best) so near-ties and
 # alternative mounts are visible. The first entry is THE best (drives the plots).
@@ -235,23 +248,27 @@ def load_robot(base_xy, height=MOUNT_HEIGHT, yaw=0.0):
     return rid
 
 def make_gripper():
-    """The vacuum tool as one massless cylinder spanning the flange down to the
-    suction face (a conservative envelope). Created once and teleported onto the
-    flange for each collision test in `reachable`. Axis is +z (vertical), matching
-    the strictly tool-down approach."""
-    col = p.createCollisionShape(p.GEOM_CYLINDER, radius=GRIPPER_RADIUS,
-                                 height=GRIPPER_STANDOFF)
-    vis = p.createVisualShape(p.GEOM_CYLINDER, radius=GRIPPER_RADIUS,
-                              length=GRIPPER_STANDOFF, rgbaColor=[0.1, 0.5, 1.0, 0.5])
+    """The vacuum tool as one massless box spanning the flange down to the foam
+    face (a conservative envelope of the 400x280 plate). Created once and teleported
+    onto the flange for each collision test. Half-extents are in the TOOL frame:
+    footprint in x/y, the stand-off along local z (the tool's down axis)."""
+    half = [GRIPPER_LENGTH / 2, GRIPPER_WIDTH / 2, GRIPPER_STANDOFF / 2]
+    col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half)
+    vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half,
+                              rgbaColor=[0.1, 0.5, 1.0, 0.5])
     # Parked far away until placed on the flange.
     return p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col,
                              baseVisualShapeIndex=vis, basePosition=[0, 0, -100])
 
-def place_gripper(gripper_id, flange_pos):
-    """Center the gripper cylinder between the flange and the suction face, axis
-    vertical (the tool is gated near-vertical, so a vertical cylinder is correct)."""
-    mid = [flange_pos[0], flange_pos[1], flange_pos[2] - GRIPPER_STANDOFF / 2]
-    p.resetBasePositionAndOrientation(gripper_id, mid, [0, 0, 0, 1])
+def place_gripper(gripper_id, flange_pos, tool_orn):
+    """Teleport the gripper box onto the flange at `tool_orn` (the commanded level
+    down-orientation, so the plate is exactly parallel to the ground and clocked by
+    its yaw), centered a half stand-off down the tool's local z-axis so it spans from
+    the flange to the foam face."""
+    R = p.getMatrixFromQuaternion(tool_orn)        # row-major; col 2 = local z (down)
+    z_axis = (R[2], R[5], R[8])
+    center = [flange_pos[i] + z_axis[i] * (GRIPPER_STANDOFF / 2) for i in range(3)]
+    p.resetBasePositionAndOrientation(gripper_id, center, tool_orn)
 
 def movable_joints(rid):
     js = []
@@ -282,14 +299,20 @@ def bin_targets():
     return np.array(pts), xs, ys, zs
 
 def down_orientations():
-    """Tool z-axis pointing down, optionally with a few tilted alternatives."""
-    base = p.getQuaternionFromEuler([math.pi, 0, 0])   # tool points -z
-    if TILT_CONE_DEG <= 0:
-        return [base]
-    oris = [base]
-    a = math.radians(TILT_CONE_DEG)
-    for roll, pitch in [(a, 0), (-a, 0), (0, a), (0, -a)]:
-        oris.append(p.getQuaternionFromEuler([math.pi + roll, pitch, 0]))
+    """Tool z-axis pointing down (foam face parallel to the ground), sampled at each
+    footprint clocking in TOOL_YAW_DEG (yaw about the vertical, so the rectangle can
+    fit different ways) and, if TILT_CONE_DEG>0, a few tilted alternatives. A pick is
+    reachable if ANY of these orientations works. roll=pi flips the tool to point
+    -z; the yaw term then rotates the (still-vertical) tool about the world z-axis."""
+    tilts = [(0.0, 0.0)]
+    if TILT_CONE_DEG > 0:
+        a = math.radians(TILT_CONE_DEG)
+        tilts += [(a, 0.0), (-a, 0.0), (0.0, a), (0.0, -a)]
+    oris = []
+    for yaw in TOOL_YAW_DEG:
+        yz = math.radians(yaw)
+        for roll, pitch in tilts:
+            oris.append(p.getQuaternionFromEuler([math.pi + roll, pitch, yz]))
     return oris
 
 def ik_seeds(lo, hi):
@@ -368,7 +391,10 @@ def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
             fk_err = float(np.linalg.norm(suction - target))
             if fk_err > FK_TOL:
                 continue
-            # (2) orientation: is the flat face parallel enough to the ground?
+            # (2) orientation: can the arm actually present the tool level here? The
+            # tool is assumed always parallel to the ground, so a config the solver
+            # can only bring within ORI_TOL of level (numerical residual) is fine,
+            # but a larger miss means this down-pose isn't reachable -> reject.
             tilt = _tool_tilt_deg(flange_orn)
             if tilt > max_tilt:
                 continue
@@ -381,12 +407,16 @@ def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
             # (5) arm vs itself
             if _penetrates(rid, rid, exclude_adjacent=True):
                 continue
-            # (6) gripper body vs bin (corner/edge clearance + vertical descent)
-            place_gripper(gripper_id, flange_pos)
+            # (6) gripper body vs bin (footprint clearance + vertical descent).
+            # The tool is assumed exactly parallel to the ground, so the plate is
+            # placed at the commanded LEVEL orientation `ori` (not the solver's <=
+            # ORI_TOL tilted result): a perfectly horizontal plate at this clocking.
+            place_gripper(gripper_id, flange_pos, ori)
             if _penetrates(gripper_id, bin_id):
                 continue
             return {"joints": [float(q) for q in sol],
                     "flange_pos": flange_pos.tolist(),
+                    "tool_orn": list(ori),
                     "suction": suction.tolist(),
                     "fk_err": fk_err, "tilt_deg": tilt}
     return None
@@ -535,6 +565,7 @@ def run():
         if N_WORKERS and N_WORKERS > 1:
             print(f"Sweeping {total} base poses x {len(targets)} targets "
                   f"on {N_WORKERS} workers...")
+            print(f"Spawning {N_WORKERS} processes...")
             with mp.Pool(N_WORKERS, initializer=_worker_init) as pool:
                 for pose_idx, mask in pool.imap_unordered(_eval_pose, poses):
                     results[pose_idx] = mask
@@ -807,8 +838,11 @@ def dump_best_data(world, bests, targets, coverage, target_freq):
     config = {
         "robot_urdf": os.path.basename(ROBOT_URDF),
         "bin_LxWxD_m": [BIN_L, BIN_W, BIN_DEPTH],
-        "gripper": {"standoff_m": GRIPPER_STANDOFF, "radius_m": GRIPPER_RADIUS,
-                    "thickness_m": GRIPPER_THICKNESS, "note": "placeholder dims"},
+        "gripper": {"model": "Schmalz FQE/FXCB 400x280 (box envelope)",
+                    "length_m": GRIPPER_LENGTH, "width_m": GRIPPER_WIDTH,
+                    "standoff_m": GRIPPER_STANDOFF,
+                    "tool_yaw_deg": list(TOOL_YAW_DEG),
+                    "note": "standoff is an estimate; footprint from datasheet"},
         "tolerances": {"fk_tol_m": FK_TOL, "collide_tol_m": COLLIDE_TOL,
                        "tilt_cone_deg": TILT_CONE_DEG, "ori_tol_deg": ORI_TOL_DEG,
                        "reach_max_m": REACH_MAX},
@@ -900,7 +934,8 @@ def render_animation(world, best, targets):
             continue
         for j, q in zip(world["joints"], sol["joints"]):
             p.resetJointState(rid, j, q)
-        place_gripper(world["gripper_id"], np.array(sol["flange_pos"]))
+        place_gripper(world["gripper_id"], np.array(sol["flange_pos"]),
+                      sol["tool_orn"])
         frames.append(frame())
     path = os.path.join(RUN_DIR, "best_pick_cycle.gif")
     if not frames:                           # no reachable picks -> still emit a frame
@@ -949,7 +984,9 @@ def pose_at(rid, ee, joints, lo, hi, target, orientations, gripper_id=None):
         flange_pos = np.array(
             p.getLinkState(rid, ee, computeForwardKinematics=True)[4])
         if gripper_id is not None:
-            place_gripper(gripper_id, flange_pos)
+            # tool assumed exactly level -> place the plate at the commanded
+            # (perfectly horizontal) orientation, not the solver's residual tilt
+            place_gripper(gripper_id, flange_pos, ori)
         suction = flange_pos - np.array([0.0, 0.0, GRIPPER_STANDOFF])
         if np.linalg.norm(suction - target) <= FK_TOL:
             return True
