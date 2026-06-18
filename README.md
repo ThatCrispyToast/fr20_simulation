@@ -51,9 +51,11 @@ or lower `N_IK_SEEDS`.
 The end effector is a **Schmalz FQE/FXCB 400×280 vacuum gripper for cobots** (ISO
 9409-1 flange, mounts directly on the FR20). Its foam face stays parallel to the
 ground, so the tool is **strictly down** (`TILT_CONE_DEG = 0`; `ORI_TOL_DEG` is slack
-for the IK orientation residual). It's modeled as a conservative **box envelope**:
-`GRIPPER_LENGTH × GRIPPER_WIDTH` footprint (400 × 280 mm) spanning a `GRIPPER_STANDOFF`
-from the flange down to the foam face. Because the plate is large and rectangular, a
+for the IK orientation residual). It's modeled as a conservative **two-part envelope**:
+a thin `GRIPPER_POST_RADIUS` cylinder over the top half of the stand-off (the slim
+mounting body just below the flange) and the full `GRIPPER_LENGTH × GRIPPER_WIDTH`
+plate (400 × 280 mm) over the bottom half, down to the foam face. Because the plate is
+large and rectangular, a
 pick near a wall only fits at some **clockings** — the tool is rotated about the
 vertical through `TOOL_YAW_DEG` (0° and 90°) and a target counts if it fits at any of
 them. You don't need the manufacturer's CAD/URDF files; just these CONFIG numbers.

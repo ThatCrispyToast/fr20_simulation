@@ -95,10 +95,10 @@ FLIP_BASE = True         # rotate base 180deg about X so the arm hangs down
 # picks straight down. The tool adds a STAND-OFF (the flange sits this far above the
 # foam face, so the arm reaches deeper) and a large rectangular FOOTPRINT that has
 # to clear the bin walls -- a 400x280 plate cannot pick close to a wall, so its
-# clocking about the vertical matters (see TOOL_YAW_DEG). Modeled as one massless
-# box spanning flange -> foam face: a conservative envelope (treats the whole body
-# as the full plate footprint). Edit these to swap tools; everything downstream
-# follows.
+# clocking about the vertical matters (see TOOL_YAW_DEG). Modeled as a thin cylinder
+# (top half of the stand-off, the slim mounting body) over the full 400x280 plate
+# (bottom half, down to the foam face) -- see GRIPPER_POST_RADIUS. Edit these to swap
+# tools; everything downstream follows.
 #   Footprint 400 x 280 mm is from the Schmalz datasheet (confirmed).
 #   STAND-OFF is an ESTIMATE: the flange->foam height is only in the STEP/2D
 #   drawing behind the retailer (Devonics/Inlux); replace 0.12 with the real value.
@@ -110,6 +110,11 @@ USE_GRIPPER       = True
 GRIPPER_LENGTH    = 0.400   # m, footprint long side  (tool-frame x)
 GRIPPER_WIDTH     = 0.280   # m, footprint short side (tool-frame y)
 GRIPPER_STANDOFF  = 0.12    # m, flange face -> foam suction face (ESTIMATE; see above)
+# The tool is two stacked halves down the stand-off: a thin (negligible) cylinder for
+# the TOP half (the slim mounting body/connection just below the flange) and the full
+# 400x280 plate for the BOTTOM half (down to the foam face). Less bulky / more faithful
+# than one solid box; the wide footprint that actually has to clear walls sits low.
+GRIPPER_POST_RADIUS = 0.02  # m, radius of the slim top-half cylinder (negligible)
 
 # Clockings (deg, about the vertical) of the rectangular footprint to try. A pick
 # counts if the plate fits at ANY clocking, so the arm is free to rotate the tool
@@ -268,27 +273,34 @@ def load_robot(base_xy, height=MOUNT_HEIGHT, yaw=0.0):
     return rid
 
 def make_gripper():
-    """The vacuum tool as one massless box spanning the flange down to the foam
-    face (a conservative envelope of the 400x280 plate). Created once and teleported
-    onto the flange for each collision test. Half-extents are in the TOOL frame:
-    footprint in x/y, the stand-off along local z (the tool's down axis)."""
-    half = [GRIPPER_LENGTH / 2, GRIPPER_WIDTH / 2, GRIPPER_STANDOFF / 2]
-    col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half)
-    vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half,
-                              rgbaColor=[0.1, 0.5, 1.0, 0.5])
+    """The vacuum tool as one massless body whose origin is the flange and whose two
+    shapes stack down the local z-axis (the tool's down direction): a thin cylinder
+    over the TOP half of the stand-off (the slim mounting body) and the full 400x280
+    box over the BOTTOM half (down to the foam face). Created once and teleported onto
+    the flange for each collision test. Half offsets: cylinder centered at STANDOFF/4,
+    box at 3*STANDOFF/4 below the flange, so the plate's bottom is the foam face."""
+    h = GRIPPER_STANDOFF
+    shapes = dict(
+        shapeTypes=[p.GEOM_CYLINDER, p.GEOM_BOX],
+        radii=[GRIPPER_POST_RADIUS, 0.0],
+        halfExtents=[[0, 0, 0], [GRIPPER_LENGTH / 2, GRIPPER_WIDTH / 2, h / 4]],
+        lengths=[h / 2, 0.0],
+    )
+    col = p.createCollisionShapeArray(
+        collisionFramePositions=[[0, 0, h / 4], [0, 0, 3 * h / 4]], **shapes)
+    vis = p.createVisualShapeArray(
+        visualFramePositions=[[0, 0, h / 4], [0, 0, 3 * h / 4]],
+        rgbaColors=[[0.6, 0.6, 0.6, 0.6], [0.1, 0.5, 1.0, 0.5]], **shapes)
     # Parked far away until placed on the flange.
     return p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col,
                              baseVisualShapeIndex=vis, basePosition=[0, 0, -100])
 
 def place_gripper(gripper_id, flange_pos, tool_orn):
-    """Teleport the gripper box onto the flange at `tool_orn` (the commanded level
-    down-orientation, so the plate is exactly parallel to the ground and clocked by
-    its yaw), centered a half stand-off down the tool's local z-axis so it spans from
-    the flange to the foam face."""
-    R = p.getMatrixFromQuaternion(tool_orn)        # row-major; col 2 = local z (down)
-    z_axis = (R[2], R[5], R[8])
-    center = [flange_pos[i] + z_axis[i] * (GRIPPER_STANDOFF / 2) for i in range(3)]
-    p.resetBasePositionAndOrientation(gripper_id, center, tool_orn)
+    """Teleport the gripper onto the flange: the body origin sits at the flange at
+    `tool_orn` (the commanded level down-orientation, so the plate is exactly parallel
+    to the ground and clocked by its yaw). The two shapes carry their own offsets down
+    the local z-axis, so the body just needs the flange pose."""
+    p.resetBasePositionAndOrientation(gripper_id, list(flange_pos), tool_orn)
 
 def movable_joints(rid):
     js = []
@@ -624,7 +636,6 @@ def run():
         if N_WORKERS and N_WORKERS > 1:
             print(f"Sweeping {total} base poses x {len(targets)} targets "
                   f"on {N_WORKERS} workers...")
-            print(f"Spawning {N_WORKERS} processes...")
             with mp.Pool(N_WORKERS, initializer=_worker_init) as pool:
                 for pose_idx, mask in pool.imap_unordered(_eval_pose, poses):
                     results[pose_idx] = mask
@@ -946,11 +957,13 @@ def dump_best_data(world, bests, diverse, targets, coverage, target_freq):
     total_poses = (len(BASE_X_RANGE) * len(BASE_Y_RANGE)
                    * len(BASE_Z_RANGE) * len(BASE_YAW_RANGE))
     gripper_cfg = ({"enabled": True,
-                    "model": "Schmalz FQE/FXCB 400x280 (box envelope)",
+                    "model": "Schmalz FQE/FXCB 400x280 (cylinder post + plate)",
                     "length_m": GRIPPER_LENGTH, "width_m": GRIPPER_WIDTH,
                     "standoff_m": GRIPPER_STANDOFF,
+                    "post_radius_m": GRIPPER_POST_RADIUS,
                     "tool_yaw_deg": list(TOOL_YAW_DEG),
-                    "note": "standoff is an estimate; footprint from datasheet"}
+                    "note": "thin post over top half, 400x280 plate over bottom half; "
+                            "standoff is an estimate; footprint from datasheet"}
                    if USE_GRIPPER else
                    {"enabled": False, "note": "bare flange (USE_GRIPPER = False)"})
     config = {

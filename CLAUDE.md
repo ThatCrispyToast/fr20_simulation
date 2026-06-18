@@ -87,9 +87,14 @@ The reachability core:
   `||flange − base||` is **2.073 m**; `REACH_MAX = 2.15`. The prune skips IK for targets
   beyond it. If you change the robot, gripper stand-off, or EE link, **re-measure** or it
   will silently prune reachable targets (a correctness bug).
-- **The gripper is a Schmalz FQE/FXCB 400×280 plate** modeled as a massless **box**
-  (`make_gripper`, `GEOM_BOX`) teleported onto the flange (`place_gripper`) for the
-  wall-clearance check. The tool is **assumed exactly parallel to the ground**, so the
+- **The gripper is a Schmalz FQE/FXCB 400×280 plate** modeled as a massless **compound
+  body** (`make_gripper`, `createCollisionShapeArray`): a thin `GRIPPER_POST_RADIUS`
+  cylinder over the top half of the stand-off and the full 400×280 box over the bottom
+  half (down to the foam face). The body origin is the flange and the two shapes carry
+  their own down-axis offsets, so `place_gripper` just sets the body to the flange pose.
+  Splitting is a fidelity/visual win — with vertical walls and a vertical tool the
+  constant XY footprint means it does **not** change coverage vs a solid box. The tool
+  is **assumed exactly parallel to the ground**, so the
   plate is placed at the commanded *level* orientation (perfectly horizontal, clocked by
   its yaw) — not the solver's ≤`ORI_TOL` tilt residual. The
   TCP is the foam face, a `GRIPPER_STANDOFF` below the flange: IK is commanded to
@@ -136,5 +141,5 @@ animation renders one frame per reachable pick — together ~15–40 s; trim via
 
 - New tunables go in the `CONFIG` block with a comment explaining units and intent.
 - Match the existing dense-comment style (the *why*, not the *what*).
-- Don't add a real gripper mesh/URDF edit for the tool — the box envelope is
+- Don't add a real gripper mesh/URDF edit for the tool — the post+plate envelope is
   intentional and conservative; just update the `GRIPPER_*` dims / `TOOL_YAW_DEG`.
