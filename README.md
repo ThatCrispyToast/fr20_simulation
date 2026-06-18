@@ -63,6 +63,21 @@ them. You don't need the manufacturer's CAD/URDF files; just these CONFIG number
 > in the downloadable STEP/2D drawing behind the retailer; replace it with the real
 > value (a one-line edit) when you have it.
 
+Set **`USE_GRIPPER = False`** to remove the tool entirely (bare flange: no stand-off,
+no footprint collision, no clocking search) — a useful baseline for "what could the
+arm reach with no gripper?" and for isolating how much the 400 × 280 plate costs.
+
+### Top-N and the "best of different sections"
+
+The top-N poses (`N_BEST`) tend to **cluster** around one spot — small perturbations of
+the same mount. So the run also reports the **best of different sections** (`N_DIVERSE`):
+high-coverage mounts that are far apart in the base-pose space, picked greedily so each
+is at least `DIVERSE_MIN_DIST` (normalized x/y/z/yaw distance) from the others. These
+are genuinely different mounts that reach the bin with similar efficacy — the
+quality-diversity view, like different mutations reaching similar fitness with very
+different weights. Both sets are printed and saved (with full per-pick data) to
+`best_versions.json` / `.npz`.
+
 ### Why multiple IK seeds
 
 A 6-DOF arm can usually reach the same tool pose in several joint configurations
@@ -85,8 +100,8 @@ every run writes a timestamped folder `out/run_<timestamp>/` containing:
 - `coverage_vs_height.png` — best-base and mean coverage as a function of mount height
 - `target_reachability.png` — for every pick point, the % of all swept base positions that can reach it (highlights intrinsically hard bin regions), sliced by depth
 - `best_pick_cycle.gif` — **reproducible** end animation of the best base driving the arm through its reachable picks (green/red target markers), rendered offline so it's produced after every run (no GUI) and is byte-identical each time
-- `best_versions.json` — config snapshot plus, for each of the top-N bases: coverage, per-depth counts, and **every pick's joint solution** (rad + deg), FK error, and tool tilt
-- `best_versions.npz` — raw arrays: coverage grid, target frequency, target coords, and per-best reach mask + joint configs (NaN where unreachable)
+- `best_versions.json` — config snapshot plus, for each pose in **`top_bests`** and **`diverse_bests`**: coverage, per-depth counts, and **every pick's joint solution** (rad + deg), FK error, and tool tilt
+- `best_versions.npz` — raw arrays: coverage grid, target frequency, target coords, and per top/diverse pose the reach mask + joint configs (NaN where unreachable)
 
 ## Watch the simulation
 
@@ -104,13 +119,24 @@ Watching the full wide-grid sweep takes a while — for a quick look, narrow the
 `BASE_*_RANGE` arrays (or `SIM_DWELL` controls how long the GUI lingers on each
 pose).
 
+### Inspect the result after a headless run
+
+To get the fast parallel sweep **and** an interactive look at the winner, leave
+`SHOW_SIM = False` but keep `SHOW_BEST_AFTER = True` (the default): the run sweeps headless,
+writes all the artifacts, then opens a GUI parked at the best base and
+cycles its reachable picks (same view as the final stage of a `SHOW_SIM` run). It
+blocks until you close the window or press `Ctrl-C`. Set `SHOW_BEST_AFTER = False`
+for fully non-interactive/batch runs. (On a machine with no display the viewer is
+skipped with a message rather than failing.)
+
 ## Tuning
 
 Everything is in the `CONFIG` block of [src/bin_reach.py](src/bin_reach.py):
-bin dimensions, `MOUNT_HEIGHT`, the `BASE_*_RANGE` sweeps, target grid
-resolution, the gripper dimensions (`GRIPPER_LENGTH` / `GRIPPER_WIDTH` /
-`GRIPPER_STANDOFF` and `TOOL_YAW_DEG`), `N_WORKERS`, `N_BEST` (how many top poses to
-report and dump), the animation settings (`SAVE_ANIMATION`, `ANIM_W/H`, `ANIM_FPS`),
+bin dimensions, `MOUNT_HEIGHT`, the `BASE_*_RANGE` sweeps, target grid resolution, the
+gripper (`USE_GRIPPER` on/off; `GRIPPER_LENGTH` / `GRIPPER_WIDTH` / `GRIPPER_STANDOFF`
+and `TOOL_YAW_DEG`), `N_WORKERS`, `N_BEST` and `N_DIVERSE` / `DIVERSE_MIN_DIST` (how
+many top + diverse poses to report and dump), the GUI options (`SHOW_SIM`,
+`SHOW_BEST_AFTER`), the animation settings (`SAVE_ANIMATION`, `ANIM_W/H`, `ANIM_FPS`),
 and tolerances. Narrow the `BASE_*_RANGE` arrays or drop their point counts (or the
 `TOOL_YAW_DEG` clockings) for a faster run; raise `N_WORKERS` to use more cores
 (default = all of them).

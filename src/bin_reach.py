@@ -19,12 +19,15 @@ What it does
       (5) the arm does not collide with itself,
       (6) the gripper body does not penetrate the walls (corner/edge clearance; with
           vertical walls this also implies clearance for the straight-down descent).
-- Reports the top-N base poses by coverage (run() returns them as an array) and,
-  after every run, writes to out/run_<timestamp>/: five diagnostic diagrams, a
-  reproducible end animation of the best base cycling its reachable picks
-  (best_pick_cycle.gif, rendered offline -- no GUI needed), and a detailed data
-  bundle on the top-N bases (best_versions.json + best_versions.npz: per-pick joint
-  solutions, FK error, tool tilt, per-depth counts, and raw arrays).
+- Reports the top-N base poses by coverage (run() returns them as an array) AND the
+  "best of different sections": high-coverage mounts that are far apart in base-pose
+  space (a quality-diversity view -- different mounts that work about as well, like
+  different mutations reaching similar fitness). After every run it writes to
+  out/run_<timestamp>/: five diagnostic diagrams, a reproducible end animation of the
+  best base cycling its reachable picks (best_pick_cycle.gif, rendered offline -- no
+  GUI needed), and a detailed data bundle on both pose sets (best_versions.json +
+  best_versions.npz: per-pick joint solutions, FK error, tool tilt, per-depth counts,
+  raw arrays). Set USE_GRIPPER=False to model a bare flange (no tool) as a baseline.
 
 Performance: the sweep is embarrassingly parallel across base poses, so it runs on
 N_WORKERS processes (each its own headless PyBullet world). Results are identical to a
@@ -34,8 +37,8 @@ Swap in your own robot / gripper
 --------------------------------
 Set ROBOT_URDF to your arm's URDF and adjust EE_LINK (or leave None to auto-pick the
 last link). Edit the gripper dimensions (GRIPPER_LENGTH / WIDTH / STANDOFF, and
-TOOL_YAW_DEG) to match your tool. Set the bin dimensions and the base sweep to match
-your cell. Everything you'll touch is in the CONFIG block.
+TOOL_YAW_DEG) to match your tool, or set USE_GRIPPER=False for a bare flange. Set the
+bin dimensions and the base sweep to match your cell. Everything is in the CONFIG block.
 """
 
 import os
@@ -64,8 +67,12 @@ ROBOT_URDF = os.path.join(_HERE, "..", "resources", "fairino20_v6.urdf")
 EE_LINK    = None        # link index of the tool tip; None = auto (last link)
 FIXED_BASE = True
 
-SHOW_SIM  = True         # True = open a PyBullet GUI and watch the arm work
+SHOW_SIM  = False         # True = open a PyBullet GUI and watch the arm work
 SIM_DWELL = 0.05         # seconds the GUI lingers on each pose so motion is visible
+# After a headless run (SHOW_SIM = False), still pop open a GUI at the end to inspect
+# the best base (the arm cycling its reachable picks, same view as the live run).
+# Blocks until you close the window / press Ctrl-C. No effect when SHOW_SIM is True.
+SHOW_BEST_AFTER = True
 OUT_DIR   = os.path.join(_HERE, "..", "out")  # base output dir; each run writes
 RUN_DIR   = OUT_DIR                            # to a timestamped subfolder (set in run())
 
@@ -95,6 +102,11 @@ FLIP_BASE = True         # rotate base 180deg about X so the arm hangs down
 #   Footprint 400 x 280 mm is from the Schmalz datasheet (confirmed).
 #   STAND-OFF is an ESTIMATE: the flange->foam height is only in the STEP/2D
 #   drawing behind the retailer (Devonics/Inlux); replace 0.12 with the real value.
+# Master toggle: False removes the tool entirely (bare flange) -- no stand-off, no
+# footprint collision, no clocking search. Useful as a baseline ("what could the arm
+# reach with no gripper?") to isolate how much the 400x280 plate costs.
+USE_GRIPPER       = True
+
 GRIPPER_LENGTH    = 0.400   # m, footprint long side  (tool-frame x)
 GRIPPER_WIDTH     = 0.280   # m, footprint short side (tool-frame y)
 GRIPPER_STANDOFF  = 0.12    # m, flange face -> foam suction face (ESTIMATE; see above)
@@ -150,6 +162,13 @@ if N_WORKERS == 1: print("!! RUNNING SINGLE THREADED !!")
 # alternative mounts are visible. The first entry is THE best (drives the plots).
 N_BEST        = 5        # how many top base poses to report and dump data for
 
+# Also report the "best of different sections": high-coverage mounts that are far
+# apart in the base-pose space. The top-N usually cluster around one spot; these are
+# the genuinely different mounts that work about as well -- the quality-diversity view
+# (different 'genomes' reaching similar fitness, like different mutations in evolution).
+N_DIVERSE        = 5     # how many diverse alternatives to report (0 to disable)
+DIVERSE_MIN_DIST = 0.30  # min separation in normalized (x,y,z,yaw) space, 0..~2
+
 # After every run, render a reproducible animation of the best base cycling through
 # its reachable picks (offline software renderer -> GIF, no GUI needed) and dump a
 # JSON/NPZ bundle of detailed per-pick data for the top-N bases.
@@ -166,11 +185,12 @@ N_IK_SEEDS = 8           # random seed configs tried per pose (plus the mid-rang
 # ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
-def connect():
-    cid = p.connect(p.GUI if SHOW_SIM else p.DIRECT)
+def connect(force_gui=False):
+    gui = SHOW_SIM or force_gui
+    cid = p.connect(p.GUI if gui else p.DIRECT)
     # Resolve the robot's package:// mesh paths relative to the URDF directory.
     p.setAdditionalSearchPath(os.path.dirname(os.path.abspath(ROBOT_URDF)))
-    if SHOW_SIM:
+    if gui:
         p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)          # hide side panels
         p.resetDebugVisualizerCamera(
             cameraDistance=2.6, cameraYaw=50, cameraPitch=-30,
@@ -308,8 +328,11 @@ def down_orientations():
     if TILT_CONE_DEG > 0:
         a = math.radians(TILT_CONE_DEG)
         tilts += [(a, 0.0), (-a, 0.0), (0.0, a), (0.0, -a)]
+    # Clocking only matters for a real (rectangular) footprint; with no tool one
+    # down-orientation suffices.
+    yaws = TOOL_YAW_DEG if USE_GRIPPER else (0.0,)
     oris = []
-    for yaw in TOOL_YAW_DEG:
+    for yaw in yaws:
         yz = math.radians(yaw)
         for roll, pitch in tilts:
             oris.append(p.getQuaternionFromEuler([math.pi + roll, pitch, yz]))
@@ -362,8 +385,9 @@ def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
     a separate IK call) is what makes them reproducible and consistent with the
     reported coverage."""
     target = np.asarray(target, dtype=float)
-    # The flange sits a stand-off above the suction contact point.
-    flange_goal = target + np.array([0.0, 0.0, GRIPPER_STANDOFF])
+    # The flange sits a stand-off above the suction contact point (0 if no tool).
+    standoff = GRIPPER_STANDOFF if USE_GRIPPER else 0.0
+    flange_goal = target + np.array([0.0, 0.0, standoff])
     base_pos = np.array(p.getBasePositionAndOrientation(rid)[0])
     # Reach prune: if even the flange goal is beyond the arm, skip all IK.
     if np.linalg.norm(flange_goal - base_pos) > REACH_MAX:
@@ -387,7 +411,7 @@ def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
             ls = p.getLinkState(rid, ee_link, computeForwardKinematics=True)
             flange_pos, flange_orn = np.array(ls[4]), ls[5]
             # (1) position: did the SUCTION FACE land on the target?
-            suction = flange_pos - np.array([0.0, 0.0, GRIPPER_STANDOFF])
+            suction = flange_pos - np.array([0.0, 0.0, standoff])
             fk_err = float(np.linalg.norm(suction - target))
             if fk_err > FK_TOL:
                 continue
@@ -411,9 +435,11 @@ def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
             # The tool is assumed exactly parallel to the ground, so the plate is
             # placed at the commanded LEVEL orientation `ori` (not the solver's <=
             # ORI_TOL tilted result): a perfectly horizontal plate at this clocking.
-            place_gripper(gripper_id, flange_pos, ori)
-            if _penetrates(gripper_id, bin_id):
-                continue
+            # Skipped entirely when the tool is toggled off (bare flange).
+            if USE_GRIPPER and gripper_id is not None:
+                place_gripper(gripper_id, flange_pos, ori)
+                if _penetrates(gripper_id, bin_id):
+                    continue
             return {"joints": [float(q) for q in sol],
                     "flange_pos": flange_pos.tolist(),
                     "tool_orn": list(ori),
@@ -441,12 +467,13 @@ def set_base(rid, base_xy, height, yaw=0.0):
 # relocates the base for every sweep point. `_W` holds the current process's world.
 _W = None
 
-def build_world():
+def build_world(force_gui=False):
     """Build one PyBullet world (bin + gripper + robot) plus the cached joint and
-    IK-seed metadata. Called once per process (each parallel worker gets its own)."""
-    connect()
+    IK-seed metadata. Called once per process (each parallel worker gets its own).
+    force_gui opens a GUI window even when SHOW_SIM is off (for the post-run viewer)."""
+    connect(force_gui=force_gui)
     bin_id = make_bin()
-    gripper_id = make_gripper()
+    gripper_id = make_gripper() if USE_GRIPPER else None
     rid = load_robot((0.0, 0.0), MOUNT_HEIGHT)
     joints = movable_joints(rid)
     lo, hi = joint_limits(rid, joints)
@@ -487,10 +514,12 @@ def _pose_list():
     return poses, meta
 
 def _aggregate(targets, meta, results):
-    """Fold per-pose masks into coverage / target_hits / ranked bests, all
-    deterministically in pose order. coverage[iz,iy,ix] keeps the BEST coverage over
-    all yaws at that XY/height. `bests` is the top-N base poses by coverage, ties
-    broken by earliest pose (matching the serial run); bests[0] is THE best."""
+    """Fold per-pose masks into coverage / target_hits / a fully ranked pose list,
+    all deterministically in pose order. coverage[iz,iy,ix] keeps the BEST coverage
+    over all yaws at that XY/height. `ranked` is every base pose sorted by coverage
+    desc, ties broken by earliest pose (matching the serial run); ranked[0] is THE
+    best. Callers slice ranked[:N_BEST] for the top list and run _select_diverse on
+    it for the spread-out alternatives."""
     coverage = np.zeros((len(BASE_Z_RANGE), len(BASE_Y_RANGE), len(BASE_X_RANGE)))
     target_hits = np.zeros(len(targets))
     ranked = []
@@ -501,11 +530,41 @@ def _aggregate(targets, meta, results):
         coverage[iz, iy, ix] = max(coverage[iz, iy, ix], cov)
         target_hits += mask
         ranked.append((cov, idx, bx, by, bz, byaw, mask))
-    # sort by coverage desc, then pose index asc (deterministic tie-break)
     ranked.sort(key=lambda r: (-r[0], r[1]))
-    bests = [{"cov": cov, "xy": (bx, by), "z": bz, "yaw": byaw, "mask": mask}
-             for cov, idx, bx, by, bz, byaw, mask in ranked[:max(N_BEST, 1)]]
-    return coverage, target_hits, bests
+    ranked = [{"cov": cov, "xy": (bx, by), "z": bz, "yaw": byaw, "mask": mask}
+              for cov, idx, bx, by, bz, byaw, mask in ranked]
+    return coverage, target_hits, ranked
+
+def _norm01(v, rng):
+    """Normalize a value to [0,1] over a sweep range (0 if the range is a point)."""
+    lo, hi = float(np.min(rng)), float(np.max(rng))
+    return 0.0 if hi <= lo else (float(v) - lo) / (hi - lo)
+
+def _genome(b):
+    """A base pose as a normalized (x, y, z, yaw) vector -- its 'weights'."""
+    return np.array([_norm01(b["xy"][0], BASE_X_RANGE),
+                     _norm01(b["xy"][1], BASE_Y_RANGE),
+                     _norm01(b["z"], BASE_Z_RANGE),
+                     _norm01(b["yaw"], BASE_YAW_RANGE)])
+
+def _select_diverse(ranked, n=None, min_dist=None):
+    """Best-of-different-sections: greedily pick high-coverage poses that are far
+    apart in the normalized base-pose ('genome') space. Walking `ranked` from the
+    top, a pose joins the set only if it is at least `min_dist` from every pose
+    already chosen -- so each is the best in its own region. The result is several
+    mounts that reach the bin with similar efficacy via very different base poses
+    (the quality-diversity / 'different mutations, similar fitness' view), as opposed
+    to the top-N which usually cluster around one spot."""
+    n = N_DIVERSE if n is None else n
+    min_dist = DIVERSE_MIN_DIST if min_dist is None else min_dist
+    picks = []
+    for b in ranked:                       # ranked is coverage-desc, so picks[0]=best
+        g = _genome(b)
+        if all(np.linalg.norm(g - _genome(q)) >= min_dist for q in picks):
+            picks.append(b)
+            if len(picks) >= n:
+                break
+    return picks
 
 def _sweep_gui(targets, poses, meta, total):
     """Single-process sweep with the live GUI/HUD (a shared GUI can't be driven
@@ -546,8 +605,8 @@ def _sweep_gui(targets, poses, meta, total):
             f"elapsed {_fmt_mmss(elapsed)}    eta {_fmt_mmss(eta)}",
         ])
         time.sleep(SIM_DWELL)
-    coverage, target_hits, bests = _aggregate(targets, meta, results)
-    return coverage, target_hits, bests, hud
+    coverage, target_hits, ranked = _aggregate(targets, meta, results)
+    return coverage, target_hits, ranked, hud
 
 def run():
     # Each run writes its diagrams to out/run_<timestamp>/ so results don't clobber.
@@ -559,7 +618,7 @@ def run():
     hud = None
 
     if SHOW_SIM:
-        coverage, target_hits, bests, hud = _sweep_gui(targets, poses, meta, total)
+        coverage, target_hits, ranked, hud = _sweep_gui(targets, poses, meta, total)
     else:
         results, t0, done = {}, time.time(), 0
         if N_WORKERS and N_WORKERS > 1:
@@ -578,16 +637,26 @@ def run():
                 results[pose_idx] = mask
                 done += 1
                 progress_bar(done, total, t0)
-        coverage, target_hits, bests = _aggregate(targets, meta, results)
+        coverage, target_hits, ranked = _aggregate(targets, meta, results)
 
+    bests = ranked[:max(N_BEST, 1)]
+    diverse = _select_diverse(ranked) if N_DIVERSE > 0 else []
     best = bests[0]
     target_freq = target_hits / total      # fraction of bases reaching each target
 
-    print(f"\nTop {len(bests)} base poses by coverage:")
-    for r, b in enumerate(bests, 1):
-        print(f"  #{r}: x={b['xy'][0]:+.3f} y={b['xy'][1]:+.3f} z={b['z']:.3f} m  "
+    def _print_pose(tag, b):
+        print(f"  {tag}: x={b['xy'][0]:+.3f} y={b['xy'][1]:+.3f} z={b['z']:.3f} m  "
               f"yaw={math.degrees(b['yaw']):+5.1f} deg  ->  {b['cov']*100:5.1f}%  "
               f"({int(b['mask'].sum())}/{len(targets)})")
+
+    print(f"\nTop {len(bests)} base poses by coverage:")
+    for r, b in enumerate(bests, 1):
+        _print_pose(f"#{r}", b)
+    if diverse:
+        print(f"Best of {len(diverse)} different sections (high coverage, far apart "
+              f"in base pose -- similar efficacy, very different mounts):")
+        for r, b in enumerate(diverse, 1):
+            _print_pose(f"D{r}", b)
     print(f"Heights tried: {[round(float(z), 3) for z in BASE_Z_RANGE]} m | "
           f"yaws tried: {[round(math.degrees(y), 1) for y in BASE_YAW_RANGE]} deg | "
           f"targets evaluated: {len(targets)}")
@@ -607,7 +676,7 @@ def run():
     # path leaves the parent worldless, so build one here.
     if _W is None:
         _worker_init()
-    saved.append(dump_best_data(_W, bests, targets, coverage, target_freq))
+    saved.append(dump_best_data(_W, bests, diverse, targets, coverage, target_freq))
     if SAVE_ANIMATION:
         saved.append(render_animation(_W, best, targets))
 
@@ -615,8 +684,21 @@ def run():
     for pth in saved:
         print(f"  - {os.path.basename(pth)}")
 
-    # --- optional: watch the arm work the best base in the GUI ---
-    if SHOW_SIM:
+    # --- view the best base in the GUI ---
+    # SHOW_SIM already has a live GUI world (_W); a headless run can still pop one
+    # open afterwards (SHOW_BEST_AFTER) by swapping its DIRECT world for a GUI one.
+    if not SHOW_SIM and SHOW_BEST_AFTER:
+        try:
+            if p.isConnected():
+                p.disconnect()
+            print("\nOpening the best base in a GUI "
+                  "(SHOW_BEST_AFTER) -- close the window or press Ctrl-C to quit.")
+            _W = build_world(force_gui=True)
+            hud = hud_create()
+        except p.error as e:                 # no display available -> skip gracefully
+            print(f"Could not open a GUI ({e}); skipping the post-run viewer.")
+            return bests
+    if SHOW_SIM or SHOW_BEST_AFTER:
         visualize_best(_W["rid"], _W["ee"], _W["joints"], _W["lo"], _W["hi"],
                        targets, _W["orientations"], best, hud, _W["gripper_id"])
     return bests
@@ -824,25 +906,57 @@ def _pick_records(world, base, targets):
         recs.append(rec)
     return recs
 
-def dump_best_data(world, bests, targets, coverage, target_freq):
-    """Write a detailed, reproducible bundle on the top-N base poses:
-      best_versions.json -- config, per-base summaries, per-depth counts, and the
-                            joint solution / FK error / tool tilt for every pick;
+def _best_block(world, b, rank, targets, zs):
+    """One base pose's full record (summary + per-depth counts + every pick's joint
+    solution) plus its (n_targets x n_joints) joint array for the NPZ."""
+    recs = _pick_records(world, b, targets)
+    mask3 = b["mask"].reshape(N_Z, N_Y, N_X)
+    per_depth = [{"z_m": round(float(zs[k]), 3),
+                  "reachable": int(mask3[k].sum()),
+                  "total": int(mask3[k].size),
+                  "pct": round(float(mask3[k].mean()) * 100, 1)}
+                 for k in range(N_Z)]
+    block = {
+        "rank": rank,
+        "base": {"x": round(float(b["xy"][0]), 4),
+                 "y": round(float(b["xy"][1]), 4),
+                 "z": round(float(b["z"]), 4),
+                 "yaw_deg": round(math.degrees(b["yaw"]), 2)},
+        "coverage_pct": round(b["cov"] * 100, 2),
+        "reachable": int(b["mask"].sum()), "total": int(b["mask"].size),
+        "per_depth": per_depth,
+        "picks": recs,
+    }
+    jc = np.full((len(targets), len(world["joints"])), np.nan)
+    for i, rec in enumerate(recs):
+        if rec["reachable"]:
+            jc[i] = rec["joints_rad"]
+    return block, jc
+
+def dump_best_data(world, bests, diverse, targets, coverage, target_freq):
+    """Write a detailed, reproducible bundle on the top-N base poses AND the diverse
+    "best of different sections":
+      best_versions.json -- config, then for each pose a summary, per-depth counts,
+                            and the joint solution / FK error / tool tilt per pick;
       best_versions.npz  -- raw arrays (coverage grid, target frequency, and per
-                            best the reach mask + joint configs, NaN where blocked).
+                            pose the reach mask + joint configs, NaN where blocked).
     """
     os.makedirs(RUN_DIR, exist_ok=True)
     zs = np.linspace(MARGIN, BIN_DEPTH - MARGIN, N_Z)
     total_poses = (len(BASE_X_RANGE) * len(BASE_Y_RANGE)
                    * len(BASE_Z_RANGE) * len(BASE_YAW_RANGE))
-    config = {
-        "robot_urdf": os.path.basename(ROBOT_URDF),
-        "bin_LxWxD_m": [BIN_L, BIN_W, BIN_DEPTH],
-        "gripper": {"model": "Schmalz FQE/FXCB 400x280 (box envelope)",
+    gripper_cfg = ({"enabled": True,
+                    "model": "Schmalz FQE/FXCB 400x280 (box envelope)",
                     "length_m": GRIPPER_LENGTH, "width_m": GRIPPER_WIDTH,
                     "standoff_m": GRIPPER_STANDOFF,
                     "tool_yaw_deg": list(TOOL_YAW_DEG),
-                    "note": "standoff is an estimate; footprint from datasheet"},
+                    "note": "standoff is an estimate; footprint from datasheet"}
+                   if USE_GRIPPER else
+                   {"enabled": False, "note": "bare flange (USE_GRIPPER = False)"})
+    config = {
+        "robot_urdf": os.path.basename(ROBOT_URDF),
+        "bin_LxWxD_m": [BIN_L, BIN_W, BIN_DEPTH],
+        "gripper": gripper_cfg,
         "tolerances": {"fk_tol_m": FK_TOL, "collide_tol_m": COLLIDE_TOL,
                        "tilt_cone_deg": TILT_CONE_DEG, "ori_tol_deg": ORI_TOL_DEG,
                        "reach_max_m": REACH_MAX},
@@ -852,40 +966,28 @@ def dump_best_data(world, bests, targets, coverage, target_freq):
                        "z": [round(float(v), 4) for v in BASE_Z_RANGE],
                        "yaw_deg": [round(math.degrees(v), 1) for v in BASE_YAW_RANGE]},
         "n_ik_seeds": N_IK_SEEDS, "n_workers": N_WORKERS,
+        "diverse_min_dist": DIVERSE_MIN_DIST,
     }
-    blocks, npz = [], {"coverage": coverage,
-                       "target_freq": target_freq.reshape(N_Z, N_Y, N_X),
-                       "targets_m": targets}
+    npz = {"coverage": coverage,
+           "target_freq": target_freq.reshape(N_Z, N_Y, N_X),
+           "targets_m": targets}
+    top_blocks = []
     for r, b in enumerate(bests, 1):
-        recs = _pick_records(world, b, targets)
-        mask3 = b["mask"].reshape(N_Z, N_Y, N_X)
-        per_depth = [{"z_m": round(float(zs[k]), 3),
-                      "reachable": int(mask3[k].sum()),
-                      "total": int(mask3[k].size),
-                      "pct": round(float(mask3[k].mean()) * 100, 1)}
-                     for k in range(N_Z)]
-        blocks.append({
-            "rank": r,
-            "base": {"x": round(float(b["xy"][0]), 4),
-                     "y": round(float(b["xy"][1]), 4),
-                     "z": round(float(b["z"]), 4),
-                     "yaw_deg": round(math.degrees(b["yaw"]), 2)},
-            "coverage_pct": round(b["cov"] * 100, 2),
-            "reachable": int(b["mask"].sum()), "total": int(b["mask"].size),
-            "per_depth": per_depth,
-            "picks": recs,
-        })
-        jc = np.full((len(targets), len(world["joints"])), np.nan)
-        for i, rec in enumerate(recs):
-            if rec["reachable"]:
-                jc[i] = rec["joints_rad"]
-        npz[f"best{r}_mask"] = b["mask"]
-        npz[f"best{r}_joints_rad"] = jc
+        block, jc = _best_block(world, b, r, targets, zs)
+        top_blocks.append(block)
+        npz[f"best{r}_mask"], npz[f"best{r}_joints_rad"] = b["mask"], jc
+    diverse_blocks = []
+    for r, b in enumerate(diverse, 1):
+        block, jc = _best_block(world, b, r, targets, zs)
+        diverse_blocks.append(block)
+        npz[f"diverse{r}_mask"], npz[f"diverse{r}_joints_rad"] = b["mask"], jc
     bundle = {
         "config": config,
         "summary": {"total_base_poses": total_poses, "total_targets": len(targets),
-                    "n_best_reported": len(bests)},
-        "bests": blocks,
+                    "n_best_reported": len(bests),
+                    "n_diverse_reported": len(diverse)},
+        "top_bests": top_blocks,
+        "diverse_bests": diverse_blocks,
     }
     jpath = os.path.join(RUN_DIR, "best_versions.json")
     with open(jpath, "w") as f:
@@ -934,8 +1036,9 @@ def render_animation(world, best, targets):
             continue
         for j, q in zip(world["joints"], sol["joints"]):
             p.resetJointState(rid, j, q)
-        place_gripper(world["gripper_id"], np.array(sol["flange_pos"]),
-                      sol["tool_orn"])
+        if world["gripper_id"] is not None:
+            place_gripper(world["gripper_id"], np.array(sol["flange_pos"]),
+                          sol["tool_orn"])
         frames.append(frame())
     path = os.path.join(RUN_DIR, "best_pick_cycle.gif")
     if not frames:                           # no reachable picks -> still emit a frame
@@ -971,7 +1074,8 @@ def pose_at(rid, ee, joints, lo, hi, target, orientations, gripper_id=None):
     place the gripper body if one is given. Returns True if the face reached within
     FK_TOL. The flange is commanded a stand-off above the contact point."""
     target = np.asarray(target, dtype=float)
-    flange_goal = (target + np.array([0.0, 0.0, GRIPPER_STANDOFF])).tolist()
+    standoff = GRIPPER_STANDOFF if USE_GRIPPER else 0.0
+    flange_goal = (target + np.array([0.0, 0.0, standoff])).tolist()
     for ori in orientations:
         sol = p.calculateInverseKinematics(
             rid, ee, flange_goal, ori,
@@ -987,7 +1091,7 @@ def pose_at(rid, ee, joints, lo, hi, target, orientations, gripper_id=None):
             # tool assumed exactly level -> place the plate at the commanded
             # (perfectly horizontal) orientation, not the solver's residual tilt
             place_gripper(gripper_id, flange_pos, ori)
-        suction = flange_pos - np.array([0.0, 0.0, GRIPPER_STANDOFF])
+        suction = flange_pos - np.array([0.0, 0.0, standoff])
         if np.linalg.norm(suction - target) <= FK_TOL:
             return True
     return False

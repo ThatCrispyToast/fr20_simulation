@@ -42,7 +42,8 @@ uv run python - <<'PY'
 import numpy as np, src.bin_reach as m
 m.BASE_X_RANGE = np.linspace(-0.3,0.3,3); m.BASE_Y_RANGE = np.linspace(-0.3,0.3,3)
 m.BASE_Z_RANGE = np.array([1.35,1.55]); m.BASE_YAW_RANGE = np.deg2rad([0.0,45.0])
-m.N_X=m.N_Y=4; m.N_Z=3; m.N_IK_SEEDS=3; m.N_WORKERS=4; m.SHOW_SIM=False
+m.N_X=m.N_Y=4; m.N_Z=3; m.N_IK_SEEDS=3; m.N_WORKERS=4
+m.SHOW_SIM=False; m.SHOW_BEST_AFTER=False   # keep it non-interactive
 print([round(b["cov"],3) for b in m.run()])
 PY
 ```
@@ -62,9 +63,14 @@ Module-level CONFIG names are read at call time, so overriding `m.<NAME>` before
    - **serial** (`N_WORKERS <= 1`): same `_eval_pose` loop in-process.
    - **GUI** (`SHOW_SIM`): `_sweep_gui`, single-process, drives the live PyBullet GUI.
 3. `_aggregate()` folds per-pose masks into the coverage grid, per-target frequency,
-   and the ranked `bests` list (top `N_BEST`).
-4. Plots (`plot_*`), then `dump_best_data()` (JSON + NPZ) and `render_animation()`
-   (GIF). `run()` returns the `bests` array.
+   and a fully `ranked` pose list. `run()` slices `ranked[:N_BEST]` for the top list
+   and `_select_diverse(ranked)` for the "best of different sections" — high-coverage
+   poses greedily spread `DIVERSE_MIN_DIST` apart in the normalized (x,y,z,yaw) genome
+   (quality-diversity; the top-N usually cluster, the diverse set doesn't).
+4. Plots (`plot_*`), then `dump_best_data()` (JSON `top_bests`+`diverse_bests`, NPZ) and
+   `render_animation()` (GIF). `run()` returns the top `bests` array. A headless run can
+   still open a GUI of the best base afterward via `SHOW_BEST_AFTER` (rebuilds the world
+   with `build_world(force_gui=True)` after swapping out the DIRECT one).
 
 The reachability core:
 - **`solve_pick()` is the single source of truth.** It returns the actual joint config
@@ -95,6 +101,11 @@ The reachability core:
   tool yaw over `TOOL_YAW_DEG` (0°, 90°) so a near-wall pick can fit with the short side
   facing the wall; a target is reachable if it fits at any clocking. Each clocking is a
   separate IK attempt, so adding clockings multiplies sweep cost.
+- **`USE_GRIPPER = False` toggles the whole tool off** (bare flange): stand-off → 0, no
+  gripper body (`gripper_id is None`), the footprint collision is skipped, and clockings
+  collapse to one. It's threaded via a local `standoff = GRIPPER_STANDOFF if USE_GRIPPER
+  else 0.0` in `solve_pick`/`pose_at` plus `is not None` guards — keep both in sync if you
+  touch the stand-off or gripper-collision logic.
 - **Strict tool-down by design:** `TILT_CONE_DEG = 0` (flat vacuum face ∥ ground),
   `ORI_TOL_DEG` is solver-residual slack. Don't raise the cone unless the tool can pick
   on a slope.
@@ -116,8 +127,10 @@ The reachability core:
 Full default sweep (5324 poses × 144 targets): ~**16–19 min** on 12 cores (~3 h
 single-process) with the two `TOOL_YAW_DEG` clockings — ~2.1 s/pose. Scales with core
 count and with the clocking count (each clocking is a separate IK attempt; one clocking
-was ~0.96 s/pose ≈ 7–9 min). The dump + animation add ~15–30 s; disable via
-`SAVE_ANIMATION` / lower `N_BEST` if needed.
+was ~0.96 s/pose ≈ 7–9 min; `USE_GRIPPER = False` collapses to one clocking too). The
+dump re-solves every target for each of the `N_BEST` + `N_DIVERSE` poses, and the
+animation renders one frame per reachable pick — together ~15–40 s; trim via
+`SAVE_ANIMATION` / `N_BEST` / `N_DIVERSE` if needed.
 
 ## Conventions
 
