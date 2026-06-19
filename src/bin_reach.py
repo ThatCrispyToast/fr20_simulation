@@ -777,6 +777,7 @@ def run():
     print(f"Saved {len(saved)} artifacts to {RUN_DIR}:")
     for pth in saved:
         print(f"  - {os.path.basename(pth)}")
+    print("Interactive 3D web view:  uv run python src/visualize_run.py")
 
     # --- view the best base in the GUI ---
     # SHOW_SIM already has a live GUI world (_W); a headless run can still pop one

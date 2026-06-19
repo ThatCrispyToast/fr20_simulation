@@ -135,6 +135,23 @@ blocks until you close the window or press `Ctrl-C`. Set `SHOW_BEST_AFTER = Fals
 for fully non-interactive/batch runs. (On a machine with no display the viewer is
 skipped with a message rather than failing.)
 
+## Interactive 3D web view
+
+A separate viewer turns a finished run's data bundle into a self-contained, orbitable
+3D HTML — no PyBullet, no re-running the sim:
+
+```bash
+uv run python src/visualize_run.py            # most recent out/run_*/
+uv run python src/visualize_run.py out/run_…  # a specific run
+uv run python src/visualize_run.py --no-open  # just write the HTML
+```
+
+It reads `best_versions.{json,npz}`, writes `view.html` into the run folder, and opens
+it in your browser. The scene shows the bin, the pick points (green = covered, faint red
+= not), the real plate **placements** (blue diamonds), and the robot base; a dropdown
+flips between the top-N and the diverse base poses. Drag to orbit, scroll to zoom. The
+HTML inlines plotly.js, so it works offline and is easy to share.
+
 ## Tuning
 
 Everything is in the `CONFIG` block of [src/bin_reach.py](src/bin_reach.py):
