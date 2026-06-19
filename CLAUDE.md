@@ -73,11 +73,20 @@ Module-level CONFIG names are read at call time, so overriding `m.<NAME>` before
    with `build_world(force_gui=True)` after swapping out the DIRECT one).
 
 The reachability core:
-- **`solve_pick()` is the single source of truth.** It returns the actual joint config
-  (or `None`) after all gates: suction-face position, tool tilt, joint limits, and
-  collisions (bin, self, gripper). Coverage, the JSON per-pick data, and the animation
-  all call `solve_pick`, so they can never disagree.
-- `reachable()` is just `solve_pick(...) is not None`.
+- **`solve_pick()` is the single source of truth for a *centered placement*.** It
+  returns the actual joint config (or `None`) after all gates: suction-face center on
+  the point, tool tilt, joint limits, and collisions (bin, self, gripper), plus
+  `ori_idx` = which clocking won. `reachable()` is just `solve_pick(...) is not None`.
+- **Coverage ≠ placement.** A point is *covered* if it lies under the foam footprint of
+  ANY collision-free placement, not only the one centered on it (so an area gripper
+  picks near-wall points off-center). `_eval_pose` builds the per-clocking *center*
+  masks from `solve_pick`, then `_covered_mask` dilates them by the plate footprint
+  (`_cover_offsets` / `_dilate_layerwise`, per clocking, within each depth layer). It
+  returns `(covered_mask, center_mask)`: **coverage/plots/`target_freq` use `covered`**;
+  the **animation and JSON joint configs use `center_mask`** (the real, achievable
+  placements). Each `ranked`/best dict carries both `mask` (covered) and `center_mask`.
+  Dilation keeps the early-out in `solve_pick` (no extra IK) and is conservative when a
+  center is reachable at multiple clockings (credits only the clocking that won).
 
 ## Non-obvious invariants — read before editing
 

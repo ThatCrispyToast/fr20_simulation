@@ -10,15 +10,21 @@ What it does
   foam face plus a large rectangular footprint that has to clear the walls. The
   plate is clocked about the vertical (TOOL_YAW_DEG) so it can be rotated to fit.
 - Sweeps a grid of base XYZ positions and headings (yaw).
-- For each base pose, samples a 3D grid of target points inside the bin and counts a
-  target as REACHABLE only if some IK solution (over several seeds) satisfies ALL of:
-      (1) the SUCTION FACE lands on the target (FK error < FK_TOL),
+- For each base pose, samples a 3D grid of points inside the bin. A point is a valid
+  PLACEMENT (the plate centered on it) if some IK solution (over several seeds) meets
+  ALL of:
+      (1) the SUCTION FACE lands on the point (FK error < FK_TOL),
       (2) the tool stays parallel to the ground (tilt < TILT_CONE_DEG + ORI_TOL_DEG),
       (3) the solution is within joint limits,
       (4) no robot link penetrates the bin walls/floor,
       (5) the arm does not collide with itself,
       (6) the gripper body does not penetrate the walls (corner/edge clearance; with
           vertical walls this also implies clearance for the straight-down descent).
+  A point is COVERED (the reported metric) if it falls under the foam footprint of ANY
+  valid placement -- not only the placement centered on it. So an area vacuum gripper
+  can pick a point near a wall by sitting the plate inward, with the point under the
+  plate's edge. Coverage = the placement grid DILATED by the plate footprint (per
+  clocking, within each depth layer); with no tool it collapses to the placements.
 - Reports the top-N base poses by coverage (run() returns them as an array) AND the
   "best of different sections": high-coverage mounts that are far apart in base-pose
   space (a quality-diversity view -- different mounts that work about as well, like
@@ -386,14 +392,18 @@ def _tool_tilt_deg(orn):
 
 def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
                orientations, seeds):
-    """The single source of truth for "can this target be picked from here".
-    Returns the first valid joint configuration (and its diagnostics) as a dict,
-    or None if no orientation/seed works. 'Valid' = the suction face lands on the
-    target with the tool pointing down, in joint limits, and collision-free against
-    the bin, the arm itself, and the gripper body. Each seed is a different starting
-    guess, so we explore the arm's multiple IK solutions instead of trusting the
-    single config one IK call happens to return. Checks run cheapest-first and bail
-    to the next attempt on the first failure.
+    """The single source of truth for a CENTERED placement: "can the gripper be put
+    here with the foam-face center exactly on the target?" Returns the first valid
+    joint configuration (and its diagnostics, incl. `ori_idx` = which clocking won) as
+    a dict, or None. 'Valid' = the suction face center lands on the target with the
+    tool pointing down, in joint limits, and collision-free against the bin, the arm
+    itself, and the gripper body. Each seed is a different starting guess, so we
+    explore the arm's multiple IK solutions instead of trusting the single config one
+    IK call happens to return. Checks run cheapest-first and bail on the first failure.
+
+    A target is *covered* (the reported coverage metric) if it falls under the foam
+    footprint of ANY such collision-free placement, not only the one centered on it --
+    see `_covered_mask`. This function finds the placements; coverage dilates them.
 
     Driving the animation and the data dump through this same function (rather than
     a separate IK call) is what makes them reproducible and consistent with the
@@ -407,7 +417,7 @@ def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
     if np.linalg.norm(flange_goal - base_pos) > REACH_MAX:
         return None
     max_tilt = TILT_CONE_DEG + ORI_TOL_DEG
-    for ori in orientations:
+    for ori_idx, ori in enumerate(orientations):
         for seed in seeds:
             # seed both the solver's starting state and its null-space target
             for j, q in zip(joints, seed):
@@ -456,7 +466,7 @@ def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
                     continue
             return {"joints": [float(q) for q in sol],
                     "flange_pos": flange_pos.tolist(),
-                    "tool_orn": list(ori),
+                    "tool_orn": list(ori), "ori_idx": ori_idx,
                     "suction": suction.tolist(),
                     "fk_err": fk_err, "tilt_deg": tilt}
     return None
@@ -477,6 +487,65 @@ def set_base(rid, base_xy, height, yaw=0.0):
     p.resetBasePositionAndOrientation(
         rid, [cx + base_xy[0], cy + base_xy[1], height], base_orientation(yaw))
 
+# ----------------------------------------------------------------------------
+# Area coverage: a target is COVERED if it falls under the foam footprint of any
+# collision-free placement -- not only the placement centered on it. We get this by
+# DILATING the reachable-center grid by the plate footprint (per clocking, within
+# each depth layer), so near-wall points the gripper can pick off-center count too.
+# ----------------------------------------------------------------------------
+def _footprint_offsets(ang, dx, dy, L, W):
+    """Grid (di, dj) index offsets in x/y whose world displacement (di*dx, dj*dy)
+    from a plate center lies under the L x W footprint clocked by `ang` (the plate's
+    long axis heading in world). A center at (ix,iy) therefore covers (ix+di, iy+dj)."""
+    if dx <= 0 or dy <= 0 or (L <= 0 and W <= 0):
+        return [(0, 0)]
+    c, s = math.cos(ang), math.sin(ang)
+    rmax = max(L, W) / 2.0
+    nx, ny = int(rmax / dx), int(rmax / dy)
+    offs = []
+    for di in range(-nx, nx + 1):
+        for dj in range(-ny, ny + 1):
+            wx, wy = di * dx, dj * dy
+            along =  c * wx + s * wy        # projection on the plate long (L) axis
+            across = -s * wx + c * wy       # projection on the plate short (W) axis
+            if abs(along) <= L / 2 + 1e-9 and abs(across) <= W / 2 + 1e-9:
+                offs.append((di, dj))
+    return offs
+
+def _cover_offsets(orientations, dx, dy):
+    """Footprint offsets for each clocking in `orientations` (index-aligned). With no
+    tool, every clocking covers just its own cell."""
+    if not USE_GRIPPER:
+        return [[(0, 0)] for _ in orientations]
+    offs = []
+    for ori in orientations:
+        m = p.getMatrixFromQuaternion(ori)         # plate long axis (local x) in world
+        ang = math.atan2(m[3], m[0])
+        offs.append(_footprint_offsets(ang, dx, dy, GRIPPER_LENGTH, GRIPPER_WIDTH))
+    return offs
+
+def _dilate_layerwise(mask3, offsets):
+    """OR-dilate a (N_Z, N_Y, N_X) center mask by grid offsets, within each depth
+    layer only (the foam footprint is horizontal at the target's depth)."""
+    out = np.zeros_like(mask3)
+    nz, ny, nx = mask3.shape
+    for di, dj in offsets:                          # center (ix,iy) -> covers (ix+di,iy+dj)
+        xd0, xd1 = max(0, di), nx + min(0, di)
+        yd0, yd1 = max(0, dj), ny + min(0, dj)
+        out[:, yd0:yd1, xd0:xd1] |= mask3[:, max(0, -dj):ny + min(0, -dj),
+                                          max(0, -di):nx + min(0, -di)]
+    return out
+
+def _covered_mask(center_by_clk, cover_offsets):
+    """Union over clockings of the dilated reachable-center masks -> covered grid
+    (flat, target order). center_by_clk[k] is the centers reachable at clocking k."""
+    covered = np.zeros(center_by_clk.shape[1], dtype=bool)
+    cov3 = covered.reshape(N_Z, N_Y, N_X)           # view; writes hit `covered`
+    for k in range(center_by_clk.shape[0]):
+        cov3 |= _dilate_layerwise(center_by_clk[k].reshape(N_Z, N_Y, N_X),
+                                  cover_offsets[k])
+    return covered
+
 # The FR20 meshes are heavy, so each process builds the world ONCE and just
 # relocates the base for every sweep point. `_W` holds the current process's world.
 _W = None
@@ -492,26 +561,37 @@ def build_world(force_gui=False):
     joints = movable_joints(rid)
     lo, hi = joint_limits(rid, joints)
     ee = EE_LINK if EE_LINK is not None else p.getNumJoints(rid) - 1
+    targets, xs, ys, _ = bin_targets()
+    dx = float(xs[1] - xs[0]) if len(xs) > 1 else BIN_L
+    dy = float(ys[1] - ys[0]) if len(ys) > 1 else BIN_W
+    orientations = down_orientations()
     return {"rid": rid, "bin_id": bin_id, "gripper_id": gripper_id,
             "joints": joints, "lo": lo, "hi": hi, "ee": ee,
-            "seeds": ik_seeds(lo, hi), "orientations": down_orientations(),
-            "targets": bin_targets()[0]}
+            "seeds": ik_seeds(lo, hi), "orientations": orientations,
+            "targets": targets, "cover_offsets": _cover_offsets(orientations, dx, dy)}
 
 def _worker_init():
     global _W
     _W = build_world()
 
 def _eval_pose(args):
-    """Evaluate one base pose -> (pose_idx, reachability mask over all targets)."""
+    """Evaluate one base pose -> (pose_idx, covered_mask, center_mask). center_mask =
+    grid points where the plate CAN be centered collision-free; covered_mask = points
+    that fall under the footprint of some such placement (center_mask dilated by the
+    plate). Coverage is reported from covered_mask; center_mask drives the animation
+    and the joint-config dump (those are the real, achievable arm poses)."""
     pose_idx, bx, by, bz, byaw = args
     w = _W
     set_base(w["rid"], (bx, by), bz, byaw)
-    mask = np.array([
-        reachable(w["rid"], w["bin_id"], w["gripper_id"], w["ee"], w["joints"],
-                  w["lo"], w["hi"], t, w["orientations"], w["seeds"])
-        for t in w["targets"]
-    ])
-    return pose_idx, mask
+    n, nclk = len(w["targets"]), len(w["orientations"])
+    center_by_clk = np.zeros((nclk, n), dtype=bool)
+    for i, t in enumerate(w["targets"]):
+        sol = solve_pick(w["rid"], w["bin_id"], w["gripper_id"], w["ee"], w["joints"],
+                         w["lo"], w["hi"], t, w["orientations"], w["seeds"])
+        if sol is not None:
+            center_by_clk[sol["ori_idx"], i] = True
+    covered = _covered_mask(center_by_clk, w["cover_offsets"])
+    return pose_idx, covered, center_by_clk.any(axis=0)
 
 def _pose_list():
     """All base poses in nested (yaw, z, y, x) order. pose_idx is the position in
@@ -535,18 +615,19 @@ def _aggregate(targets, meta, results):
     best. Callers slice ranked[:N_BEST] for the top list and run _select_diverse on
     it for the spread-out alternatives."""
     coverage = np.zeros((len(BASE_Z_RANGE), len(BASE_Y_RANGE), len(BASE_X_RANGE)))
-    target_hits = np.zeros(len(targets))
+    target_hits = np.zeros(len(targets))         # how many bases COVER each target
     ranked = []
     for idx in range(len(meta)):
-        mask = results[idx]
+        covered, center = results[idx]
         iz, iy, ix, bx, by, bz, byaw = meta[idx]
-        cov = float(mask.mean())
+        cov = float(covered.mean())
         coverage[iz, iy, ix] = max(coverage[iz, iy, ix], cov)
-        target_hits += mask
-        ranked.append((cov, idx, bx, by, bz, byaw, mask))
+        target_hits += covered
+        ranked.append((cov, idx, bx, by, bz, byaw, covered, center))
     ranked.sort(key=lambda r: (-r[0], r[1]))
-    ranked = [{"cov": cov, "xy": (bx, by), "z": bz, "yaw": byaw, "mask": mask}
-              for cov, idx, bx, by, bz, byaw, mask in ranked]
+    ranked = [{"cov": cov, "xy": (bx, by), "z": bz, "yaw": byaw,
+               "mask": covered, "center_mask": center}
+              for cov, idx, bx, by, bz, byaw, covered, center in ranked]
     return coverage, target_hits, ranked
 
 def _norm01(v, rng):
@@ -591,18 +672,18 @@ def _sweep_gui(targets, poses, meta, total):
           "a while, so use a smaller grid if you just want a quick look.")
     results, t0, done, best = {}, time.time(), 0, {"cov": -1}
     for ps in poses:
-        pose_idx, mask = _eval_pose(ps)
-        results[pose_idx] = mask
+        pose_idx, covered, center = _eval_pose(ps)
+        results[pose_idx] = (covered, center)
         _, bx, by, bz, byaw = ps
-        cov = mask.mean()
+        cov = covered.mean()
         if cov > best["cov"]:
             best = {"cov": cov, "xy": (bx, by), "z": bz, "yaw": byaw}
         done += 1
         progress_bar(done, total, t0)
-        reach_pts = targets[mask]
-        if len(reach_pts):
+        place_pts = targets[center]            # real, achievable plate placements
+        if len(place_pts):
             pose_at(_W["rid"], _W["ee"], _W["joints"], _W["lo"], _W["hi"],
-                    reach_pts[len(reach_pts) // 2], _W["orientations"],
+                    place_pts[len(place_pts) // 2], _W["orientations"],
                     _W["gripper_id"])
         elapsed = time.time() - t0
         eta = elapsed / done * (total - done)
@@ -611,7 +692,7 @@ def _sweep_gui(targets, poses, meta, total):
             f"base   x={bx:+.2f}  y={by:+.2f}  z={bz:.2f} m  "
             f"yaw={math.degrees(byaw):+.0f}deg",
             f"coverage here:   {cov*100:4.1f}%   "
-            f"({int(mask.sum())}/{len(targets)} picks)",
+            f"({int(covered.sum())}/{len(targets)} covered)",
             f"best so far:   {best['cov']*100:4.1f}%   "
             f"@ x={best['xy'][0]:+.2f} y={best['xy'][1]:+.2f} "
             f"z={best['z']:.2f} yaw={math.degrees(best['yaw']):+.0f}",
@@ -639,15 +720,15 @@ def run():
             print(f"Sweeping {total} base poses x {len(targets)} targets "
                   f"on {N_WORKERS} workers...")
             with mp.Pool(N_WORKERS, initializer=_worker_init) as pool:
-                for pose_idx, mask in pool.imap_unordered(_eval_pose, poses):
-                    results[pose_idx] = mask
+                for pose_idx, covered, center in pool.imap_unordered(_eval_pose, poses):
+                    results[pose_idx] = (covered, center)
                     done += 1
                     progress_bar(done, total, t0)
         else:
             _worker_init()
             for ps in poses:
-                pose_idx, mask = _eval_pose(ps)
-                results[pose_idx] = mask
+                pose_idx, covered, center = _eval_pose(ps)
+                results[pose_idx] = (covered, center)
                 done += 1
                 progress_bar(done, total, t0)
         coverage, target_hits, ranked = _aggregate(targets, meta, results)
@@ -775,7 +856,7 @@ def plot_coverage_grid(coverage, best):
     return path
 
 def plot_best_slices(best, xs, ys, zs):
-    """Reachable pick points at the best base, sliced by depth, with the
+    """Covered pick points at the best base, sliced by depth, with the
     bin outline, the sample grid ticks, and per-slice counts."""
     mask = best["mask"].reshape(N_Z, N_Y, N_X)
     extent = _cell_extent(xs, ys)
@@ -790,15 +871,15 @@ def plot_best_slices(best, xs, ys, zs):
         for lbl in a.get_xticklabels():
             lbl.set_rotation(90)
         n_ok, n_tot = int(mask[k].sum()), mask[k].size
-        a.set_title(f"z = {zs[k]:.2f} m\n{n_ok}/{n_tot} reachable "
+        a.set_title(f"z = {zs[k]:.2f} m\n{n_ok}/{n_tot} covered "
                     f"({mask[k].mean()*100:.0f}%)", fontsize=9)
         a.set_xlabel("x (m)")
         if k == 0:
             a.set_ylabel("y (m)")
-    fig.suptitle(f"Reachable pick points by depth at best base  "
+    fig.suptitle(f"Covered pick points by depth at best base  "
                  f"(x={best['xy'][0]:+.2f}, y={best['xy'][1]:+.2f}, "
                  f"z={best['z']:.2f} m, yaw={math.degrees(best['yaw']):+.0f}deg)   "
-                 f"green = reachable, red = not", fontsize=11)
+                 f"green = covered (foam can reach it), red = not", fontsize=11)
     fig.tight_layout()
     path = os.path.join(RUN_DIR, "best_pos_slices.png")
     fig.savefig(path, dpi=130)
@@ -818,7 +899,7 @@ def _draw_bin_wireframe(ax):
         ax.plot([xx, xx], [yy, yy], [z0, z1], c="gray", lw=1.0)
 
 def plot_reach_3d(best, targets):
-    """3D scatter of reachable vs unreachable pick points at the best base,
+    """3D scatter of covered vs not-covered pick points at the best base,
     with the bin drawn as a wireframe and the robot base marked."""
     reach = targets[best["mask"]]
     miss = targets[~best["mask"]]
@@ -827,14 +908,14 @@ def plot_reach_3d(best, targets):
     _draw_bin_wireframe(ax)
     if len(miss):
         ax.scatter(miss[:, 0], miss[:, 1], miss[:, 2], c="red", marker="x",
-                   s=30, alpha=0.6, label=f"unreachable ({len(miss)})")
+                   s=30, alpha=0.6, label=f"not covered ({len(miss)})")
     if len(reach):
         ax.scatter(reach[:, 0], reach[:, 1], reach[:, 2], c="green", marker="o",
-                   s=35, alpha=0.9, label=f"reachable ({len(reach)})")
+                   s=35, alpha=0.9, label=f"covered ({len(reach)})")
     ax.scatter([best["xy"][0]], [best["xy"][1]], [best["z"]], c="black",
                marker="^", s=130, label=f"robot base (z={best['z']:.2f} m)")
     ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)"); ax.set_zlabel("z (m)")
-    ax.set_title(f"Reachable pick points in 3D at best base  "
+    ax.set_title(f"Covered pick points in 3D at best base  "
                  f"({best['cov']*100:.1f}% coverage)")
     ax.legend(loc="upper left", fontsize=8)
     ax.view_init(elev=22, azim=-60)
@@ -888,8 +969,8 @@ def plot_target_frequency(target_freq, xs, ys, zs):
         a.set_xlabel("x (m)")
         if k == 0:
             a.set_ylabel("y (m)")
-    fig.suptitle("Target reachability across ALL base positions "
-                 "(% of swept bases that can reach each point)", fontsize=11)
+    fig.suptitle("Target coverage across ALL base positions "
+                 "(% of swept bases whose foam can reach each point)", fontsize=11)
     fig.colorbar(im, ax=axes.ravel().tolist(), label="% of bases")
     path = os.path.join(RUN_DIR, "target_reachability.png")
     fig.savefig(path, dpi=130)
@@ -899,18 +980,19 @@ def plot_target_frequency(target_freq, xs, ys, zs):
 # ----------------------------------------------------------------------------
 # Detailed data dump + reproducible end animation (run after every sweep)
 # ----------------------------------------------------------------------------
-def _pick_records(world, base, targets):
-    """Per-target detail for one base pose: reachable flag and, when reachable, the
-    joint solution / FK error / tool tilt. Re-solved with solve_pick (the same
-    deterministic logic as the sweep) so the records match the reported coverage."""
+def _pick_records(world, base, targets, covered):
+    """Per-target detail for one base pose. `covered` marks points the foam footprint
+    reaches (the reported metric). Each target is also re-solved with solve_pick (the
+    same deterministic logic as the sweep) to flag the points where the plate can be
+    CENTERED -- a real placement -- and log its joint solution / FK error / tool tilt."""
     set_base(world["rid"], base["xy"], base["z"], base["yaw"])
     recs = []
-    for t in targets:
+    for t, cov in zip(targets, covered):
         sol = solve_pick(world["rid"], world["bin_id"], world["gripper_id"],
                          world["ee"], world["joints"], world["lo"], world["hi"],
                          t, world["orientations"], world["seeds"])
         rec = {"target_m": [round(float(v), 4) for v in t],
-               "reachable": sol is not None}
+               "covered": bool(cov), "is_placement": sol is not None}
         if sol is not None:
             rec["joints_rad"] = [round(q, 5) for q in sol["joints"]]
             rec["joints_deg"] = [round(math.degrees(q), 2) for q in sol["joints"]]
@@ -920,12 +1002,13 @@ def _pick_records(world, base, targets):
     return recs
 
 def _best_block(world, b, rank, targets, zs):
-    """One base pose's full record (summary + per-depth counts + every pick's joint
-    solution) plus its (n_targets x n_joints) joint array for the NPZ."""
-    recs = _pick_records(world, b, targets)
+    """One base pose's full record (summary + per-depth COVERED counts + every pick's
+    covered/placement flags and joint solution) plus its (n_targets x n_joints) joint
+    array for the NPZ (filled at the centered placements)."""
+    recs = _pick_records(world, b, targets, b["mask"])
     mask3 = b["mask"].reshape(N_Z, N_Y, N_X)
     per_depth = [{"z_m": round(float(zs[k]), 3),
-                  "reachable": int(mask3[k].sum()),
+                  "covered": int(mask3[k].sum()),
                   "total": int(mask3[k].size),
                   "pct": round(float(mask3[k].mean()) * 100, 1)}
                  for k in range(N_Z)]
@@ -936,13 +1019,14 @@ def _best_block(world, b, rank, targets, zs):
                  "z": round(float(b["z"]), 4),
                  "yaw_deg": round(math.degrees(b["yaw"]), 2)},
         "coverage_pct": round(b["cov"] * 100, 2),
-        "reachable": int(b["mask"].sum()), "total": int(b["mask"].size),
+        "covered": int(b["mask"].sum()), "total": int(b["mask"].size),
+        "placements": int(b["center_mask"].sum()),
         "per_depth": per_depth,
         "picks": recs,
     }
     jc = np.full((len(targets), len(world["joints"])), np.nan)
     for i, rec in enumerate(recs):
-        if rec["reachable"]:
+        if rec["is_placement"]:
             jc[i] = rec["joints_rad"]
     return block, jc
 
@@ -990,12 +1074,16 @@ def dump_best_data(world, bests, diverse, targets, coverage, target_freq):
     for r, b in enumerate(bests, 1):
         block, jc = _best_block(world, b, r, targets, zs)
         top_blocks.append(block)
-        npz[f"best{r}_mask"], npz[f"best{r}_joints_rad"] = b["mask"], jc
+        npz[f"best{r}_covered_mask"] = b["mask"]
+        npz[f"best{r}_center_mask"] = b["center_mask"]
+        npz[f"best{r}_joints_rad"] = jc
     diverse_blocks = []
     for r, b in enumerate(diverse, 1):
         block, jc = _best_block(world, b, r, targets, zs)
         diverse_blocks.append(block)
-        npz[f"diverse{r}_mask"], npz[f"diverse{r}_joints_rad"] = b["mask"], jc
+        npz[f"diverse{r}_covered_mask"] = b["mask"]
+        npz[f"diverse{r}_center_mask"] = b["center_mask"]
+        npz[f"diverse{r}_joints_rad"] = jc
     bundle = {
         "config": config,
         "summary": {"total_base_poses": total_poses, "total_targets": len(targets),
@@ -1030,8 +1118,10 @@ def render_animation(world, best, targets):
     os.makedirs(RUN_DIR, exist_ok=True)
     rid = world["rid"]
     set_base(rid, best["xy"], best["z"], best["yaw"])
+    # markers: green = covered (the reported metric); the arm visits the real
+    # collision-free plate placements (center_mask), which cover that whole region.
     _add_target_markers(targets, best["mask"])
-    reach_pts = targets[best["mask"]]
+    reach_pts = targets[best.get("center_mask", best["mask"])]
     view = p.computeViewMatrixFromYawPitchRoll(
         [BIN_CENTER_XY[0], BIN_CENTER_XY[1], BIN_DEPTH / 2], 2.9, 50, -35, 0, 2)
     proj = p.computeProjectionMatrixFOV(60, ANIM_W / ANIM_H, 0.1, 10)

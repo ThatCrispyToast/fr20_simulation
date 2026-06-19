@@ -6,11 +6,15 @@ gripper** (suction face parallel to the ground, picking straight down). Headless
 (PyBullet `DIRECT`), parallelized across CPU cores; writes five diagnostic diagrams
 and prints a terminal progress bar.
 
-A pick counts as reachable only if some IK solution lands the suction face on the
-target with the tool pointing straight down, in joint limits, and collision-free —
-checked against the bin walls, the arm against **itself**, and the **gripper body**
-against the walls (so near-wall picks the 400×280 plate can't fit are correctly
-excluded — for which the tool is clocked to whichever rotation fits best).
+A **placement** is valid when some IK solution centers the foam face on a grid point
+with the tool pointing straight down, in joint limits, and collision-free — checked
+against the bin walls, the arm against **itself**, and the **gripper body** against
+the walls (the 400×280 plate is clocked to whichever rotation fits best). A point is
+then counted as **covered** if it falls under the foam footprint of *any* valid
+placement, not only the one centered on it — i.e. the area gripper can pick a point
+near a wall by sitting the plate inward, with the point under the plate's edge.
+Coverage is the placement grid dilated by the plate footprint; it's the reported
+metric and is much higher than centered-placement reachability near the walls.
 
 ## Setup
 
@@ -97,13 +101,13 @@ little) with more seeds.
 every run writes a timestamped folder `out/run_<timestamp>/` containing:
 
 - `coverage_vs_base.png` — coverage % across the base XY grid, one panel per mount height, with per-cell values, the bin footprint, and the best base starred
-- `best_pos_slices.png` — reachable pick points at the best base, sliced by depth, with the bin outline and per-slice counts
-- `reach_3d.png` — 3D scatter of reachable vs unreachable pick points at the best base, with the bin wireframe and the robot base
+- `best_pos_slices.png` — covered pick points at the best base, sliced by depth, with the bin outline and per-slice counts
+- `reach_3d.png` — 3D scatter of covered vs not-covered pick points at the best base, with the bin wireframe and the robot base
 - `coverage_vs_height.png` — best-base and mean coverage as a function of mount height
-- `target_reachability.png` — for every pick point, the % of all swept base positions that can reach it (highlights intrinsically hard bin regions), sliced by depth
-- `best_pick_cycle.gif` — **reproducible** end animation of the best base driving the arm through its reachable picks (green/red target markers), rendered offline so it's produced after every run (no GUI) and is byte-identical each time
-- `best_versions.json` — config snapshot plus, for each pose in **`top_bests`** and **`diverse_bests`**: coverage, per-depth counts, and **every pick's joint solution** (rad + deg), FK error, and tool tilt
-- `best_versions.npz` — raw arrays: coverage grid, target frequency, target coords, and per top/diverse pose the reach mask + joint configs (NaN where unreachable)
+- `target_reachability.png` — for every pick point, the % of all swept base positions whose foam can cover it (highlights intrinsically hard bin regions), sliced by depth
+- `best_pick_cycle.gif` — **reproducible** end animation of the best base driving the arm through its real plate **placements** (markers: green = covered, red = not), rendered offline so it's produced after every run (no GUI) and is byte-identical each time
+- `best_versions.json` — config snapshot plus, for each pose in **`top_bests`** and **`diverse_bests`**: coverage, per-depth counts, and **every point's** `covered`/`is_placement` flags with the joint solution (rad + deg), FK error, and tool tilt at each placement
+- `best_versions.npz` — raw arrays: coverage grid, target frequency, target coords, and per top/diverse pose the covered mask, the centered-placement mask, and joint configs (NaN where not a placement)
 
 ## Watch the simulation
 
