@@ -64,6 +64,7 @@ window.addEventListener('resize', () => {
 // ---------------------------------------------------------------------------
 let CFG = null;                 // config block from the JSON
 let GRID = null;                // {nx, ny, nz}
+let PKT = null;                 // packet dims {length_m, width_m, height_m}
 let poses = [];                 // [{label, ...best_block}]
 let robot = null;               // URDFRobot
 let gripper = null;             // THREE.Group (post + plate)
@@ -157,31 +158,36 @@ function placeGripper(toolYawDeg) {
 }
 
 // ---------------------------------------------------------------------------
-// Targets: one small sphere per pick (600), coloured by outcome. Kept
+// Packets: one box per grid target (600), coloured by outcome. Each is a real
+// packet resting in the bin (top face at target z, the pick plane). Kept
 // index-aligned to pose.picks so depth slicing and playback are simple lookups.
 // ---------------------------------------------------------------------------
 function classOf(pick) {
   if (pick.is_placement) return 'place';
-  return pick.covered ? 'cover' : 'miss';
+  // `pickable` is the current field; fall back to `covered` for older JSON.
+  const ok = pick.pickable !== undefined ? pick.pickable : pick.covered;
+  return ok ? 'cover' : 'miss';
 }
 function depthOf(i) { return Math.floor(i / (GRID.nx * GRID.ny)); }  // z-major order
 
 function buildTargets(pose) {
-  for (const m of targetMeshes) scene.remove(m);
+  for (const m of targetMeshes) { scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
   targetMeshes = [];
-  const geo = new THREE.SphereGeometry(0.016, 12, 8);
+  const geo = new THREE.BoxGeometry(PKT.length_m, PKT.width_m, PKT.height_m);
   pose.picks.forEach((pick) => {
     const cls = classOf(pick);
-    const mat = new THREE.MeshBasicMaterial({ color: COL[cls] });
+    const mat = new THREE.MeshStandardMaterial({
+      color: COL[cls], transparent: true, opacity: 0.85, roughness: 0.8 });
     const m = new THREE.Mesh(geo, mat);
-    m.position.set(...pick.target_m);
+    const [x, y, z] = pick.target_m;              // z = packet top -> box center is z - h/2
+    m.position.set(x, y, z - PKT.height_m / 2);
     m.userData.cls = cls;
     scene.add(m);
     targetMeshes.push(m);
   });
-  if (!cursor) {
+  if (!cursor) {                                  // wireframe box highlighting the active packet
     cursor = new THREE.Mesh(
-      new THREE.SphereGeometry(0.03, 16, 12),
+      new THREE.BoxGeometry(PKT.length_m * 1.06, PKT.width_m * 1.06, PKT.height_m * 1.06),
       new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true }));
     cursor.visible = false;
     scene.add(cursor);
@@ -238,9 +244,10 @@ function selectPose(i) {
   playStep = 0; setPlaying(false);
 
   const b = curPose.base;
+  const npick = curPose.pickable !== undefined ? curPose.pickable : curPose.covered;
   document.getElementById('readout').innerHTML =
-    `<span class="big">${curPose.coverage_pct}%</span> covered ` +
-    `(${curPose.covered}/${curPose.total})<br>` +
+    `<span class="big">${curPose.coverage_pct}%</span> pickable ` +
+    `(${npick}/${curPose.total} packets)<br>` +
     `<b>${curPose.placements}</b> centered placements<br>` +
     `base &nbsp;x=<b>${b.x}</b> y=<b>${b.y}</b> z=<b>${b.z}</b> m<br>` +
     `yaw=<b>${b.yaw_deg}&deg;</b>`;
@@ -262,7 +269,8 @@ function gotoPlacement(step) {
   const idx = placementIdx[playStep];
   const pick = curPose.picks[idx];
   setJoints(pick.joints_rad, pick.tool_yaw_deg);
-  cursor.position.set(...pick.target_m);
+  const [cx, cy, cz] = pick.target_m;            // match the packet box center (top at z)
+  cursor.position.set(cx, cy, cz - PKT.height_m / 2);
   cursor.visible = true;
   document.getElementById('pick-info').innerHTML =
     `pick <b>${playStep + 1}</b>/${placementIdx.length} &nbsp; ` +
@@ -343,6 +351,7 @@ async function main() {
   if (!bundle) return;
   CFG = bundle.config;
   GRID = CFG.target_grid;
+  PKT = CFG.packet || { length_m: 0.2413, width_m: 0.3302, height_m: 0.0318 };
   document.getElementById('run-label').textContent =
     `${runArg.split('/').slice(-2, -1)[0] || 'run'} · ` +
     `${bundle.summary.total_base_poses} poses × ${bundle.summary.total_targets} targets`;

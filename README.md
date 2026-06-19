@@ -1,20 +1,24 @@
 # FR20 bin-reachability feasibility study
 
 Sweeps overhead mount positions for a Fairino **FR20** arm hanging over a pallet
-bin and reports how much of the bin interior it can reach with a **flat vacuum
-gripper** (suction face parallel to the ground, picking straight down). Headless
-(PyBullet `DIRECT`), parallelized across CPU cores; writes five diagnostic diagrams
-and prints a terminal progress bar.
+bin and reports how many **packets** it can pick with a **flat vacuum gripper**
+(suction face parallel to the ground, picking straight down). Headless (PyBullet
+`DIRECT`), parallelized across CPU cores; writes five diagnostic diagrams and prints
+a terminal progress bar.
 
-A **placement** is valid when some IK solution centers the foam face on a grid point
-with the tool pointing straight down, in joint limits, and collision-free — checked
-against the bin walls, the arm against **itself**, and the **gripper body** against
-the walls (the 400×280 plate is clocked to whichever rotation fits best). A point is
-then counted as **covered** if it falls under the foam footprint of *any* valid
-placement, not only the one centered on it — i.e. the area gripper can pick a point
-near a wall by sitting the plate inward, with the point under the plate's edge.
-Coverage is the placement grid dilated by the plate footprint; it's the reported
-metric and is much higher than centered-placement reachability near the walls.
+The bin is filled with a 3D grid of **packets** — real rectangular boxes (default
+**9.5 × 13 × 1.25 in**, sizes are parameters) resting with their top face at each
+sampled depth. A **placement** is valid when some IK solution centers the foam face
+on a packet with the tool pointing straight down, in joint limits, and collision-free
+— checked against the bin walls, the arm against **itself**, and the **gripper body**
+against the walls (the 400×280 plate is clocked to whichever rotation fits best). A
+packet is then counted as **pickable** if some valid placement — not only the one
+centered on it — covers at least `PACKET_CONTACT_FRAC` (default **60%**) of the
+**packet's top** with the **tool bottom** (the foam face), i.e. enough of the packet
+sits under the suction face to lift it. So the area gripper picks a packet near a wall
+by sitting the plate inward, as long as enough of the packet stays under the foam.
+Pickability is the reachable-center grid dilated by the set of contact-satisfying
+packet offsets, and is the reported metric.
 
 ## Setup
 
@@ -100,24 +104,24 @@ little) with more seeds.
 `run()` returns the **top-N base poses** as an array (`N_BEST`, best first), and
 every run writes a timestamped folder `out/run_<timestamp>/` containing:
 
-- `coverage_vs_base.png` — coverage % across the base XY grid, one panel per mount height, with per-cell values, the bin footprint, and the best base starred
-- `best_pos_slices.png` — covered pick points at the best base, sliced by depth, with the bin outline and per-slice counts
-- `reach_3d.png` — 3D scatter of covered vs not-covered pick points at the best base, with the bin wireframe and the robot base
+- `coverage_vs_base.png` — coverage % (pickable packets) across the base XY grid, one panel per mount height, with per-cell values, the bin footprint, and the best base starred
+- `best_pos_slices.png` — pickable packets at the best base, sliced by depth, with the bin outline and per-slice counts
+- `reach_3d.png` — 3D scatter of pickable vs not-pickable packets at the best base, with the bin wireframe and the robot base
 - `coverage_vs_height.png` — best-base and mean coverage as a function of mount height
-- `target_reachability.png` — for every pick point, the % of all swept base positions whose foam can cover it (highlights intrinsically hard bin regions), sliced by depth
-- `best_pick_cycle.gif` — **reproducible** end animation of the best base driving the arm through its real plate **placements** (markers: green = covered, red = not), rendered offline so it's produced after every run (no GUI) and is byte-identical each time
-- `best_versions.json` — config snapshot plus, for each pose in **`top_bests`** and **`diverse_bests`**: coverage, per-depth counts, and **every point's** `covered`/`is_placement` flags with the joint solution (rad + deg), FK error, tool tilt, and the winning footprint clocking (`tool_yaw_deg`) at each placement
-- `best_versions.npz` — raw arrays: coverage grid, target frequency, target coords, and per top/diverse pose the covered mask, the centered-placement mask, and joint configs (NaN where not a placement)
+- `target_reachability.png` — for every packet position, the % of all swept base positions that can pick it (highlights intrinsically hard bin regions), sliced by depth
+- `best_pick_cycle.gif` — **reproducible** end animation of the best base driving the arm through its real plate **placements**, packets drawn as boxes (markers: green = pickable, red = not), rendered offline so it's produced after every run (no GUI) and is byte-identical each time
+- `best_versions.json` — config snapshot (incl. the `packet` block) plus, for each pose in **`top_bests`** and **`diverse_bests`**: coverage, per-depth counts, and **every packet's** `pickable`/`is_placement` flags with the joint solution (rad + deg), FK error, tool tilt, and the winning footprint clocking (`tool_yaw_deg`) at each placement
+- `best_versions.npz` — raw arrays: coverage grid, target frequency, packet-center coords, and per top/diverse pose the pickable mask, the centered-placement mask, and joint configs (NaN where not a placement)
 
 ## Interactive 3D viewer (three.js)
 
 A browser viewer renders a run's `best_versions.json` in 3D: the bin, the
 **articulated FR20** (loaded from the URDF + STL meshes), the vacuum-gripper plate,
-and the swept pick targets coloured by outcome (green = a centered **placement**,
-amber = covered off-centre, red = not covered). Pick any reported base pose (top-N
-or diverse), slice the target grid by depth, toggle layers, and **play the arm
-through its real placements** — driven by the joint solutions in the JSON, so the
-poses match the study exactly.
+and the **packets** drawn as boxes coloured by outcome (green = a centered
+**placement**, amber = pickable off-centre, red = not pickable). Pick any reported
+base pose (top-N or diverse), slice the packet grid by depth, toggle layers, and
+**play the arm through its real placements** — driven by the joint solutions in the
+JSON, so the poses match the study exactly.
 
 ```bash
 uv run python src/serve_viz.py                 # newest out/run_* folder
@@ -161,9 +165,11 @@ skipped with a message rather than failing.)
 
 Everything is in the `CONFIG` block of [src/bin_reach.py](src/bin_reach.py):
 bin dimensions, `MOUNT_HEIGHT`, the `BASE_*_RANGE` sweeps, target grid resolution, the
-gripper (`USE_GRIPPER` on/off; `GRIPPER_LENGTH` / `GRIPPER_WIDTH` / `GRIPPER_STANDOFF`
-and `TOOL_YAW_DEG`), `N_WORKERS`, `N_BEST` and `N_DIVERSE` / `DIVERSE_MIN_DIST` (how
-many top + diverse poses to report and dump), the GUI options (`SHOW_SIM`,
+**packet** (`PACKET_L` / `PACKET_W` / `PACKET_H` and the `PACKET_CONTACT_FRAC` grip
+threshold), the gripper (`USE_GRIPPER` on/off; `GRIPPER_LENGTH` / `GRIPPER_WIDTH` /
+`GRIPPER_STANDOFF` and `TOOL_YAW_DEG`), `N_WORKERS`, `N_BEST` and `N_DIVERSE` /
+`DIVERSE_MIN_DIST` (how many top + diverse poses to report and dump), the GUI options
+(`SHOW_SIM`,
 `SHOW_BEST_AFTER`), the animation settings (`SAVE_ANIMATION`, `ANIM_W/H`, `ANIM_FPS`),
 and tolerances. Narrow the `BASE_*_RANGE` arrays or drop their point counts (or the
 `TOOL_YAW_DEG` clockings) for a faster run; raise `N_WORKERS` to use more cores
@@ -172,9 +178,14 @@ and tolerances. Narrow the `BASE_*_RANGE` arrays or drop their point counts (or 
 ### Known limitations
 
 - **Goal-pose only.** Each pick is checked as a static configuration. The gripper's
-  own vertical descent is covered (vertical walls + a horizontal plate at fixed XY),
-  but a full collision-free *arm trajectory* into the bin is not planned — coverage
-  is an upper bound on what a real motion planner would achieve.
+  own vertical descent is accounted for (vertical walls + a horizontal plate at fixed
+  XY), but a full collision-free *arm trajectory* into the bin is not planned —
+  coverage is an upper bound on what a real motion planner would achieve.
+- **Packets are tested in isolation.** Each packet is evaluated alone in an otherwise
+  empty bin (like the old point targets), so neighbouring packets are not modelled as
+  obstacles, and the grip test is a geometric foam-overlap fraction, not a force/seal
+  simulation. Packets are axis-aligned with the bin at a single nominal size; vary the
+  `PACKET_*` dims (per packet, if you extend it) for a size mix.
 - **Coverage is a lower bound.** Numerical IK with finite seeds yields occasional
   false negatives; the reported percentages rise slightly with `N_IK_SEEDS`.
 - **Estimated stand-off.** The 400 × 280 footprint is from the datasheet, but the

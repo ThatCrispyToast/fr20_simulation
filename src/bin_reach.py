@@ -10,21 +10,26 @@ What it does
   foam face plus a large rectangular footprint that has to clear the walls. The
   plate is clocked about the vertical (TOOL_YAW_DEG) so it can be rotated to fit.
 - Sweeps a grid of base XYZ positions and headings (yaw).
-- For each base pose, samples a 3D grid of points inside the bin. A point is a valid
-  PLACEMENT (the plate centered on it) if some IK solution (over several seeds) meets
-  ALL of:
-      (1) the SUCTION FACE lands on the point (FK error < FK_TOL),
+- For each base pose, samples a 3D grid of PACKETS inside the bin -- each grid point
+  is the center of a real rectangular packet (a box) resting in the bin, axis-aligned
+  with it, its TOP face at that depth (the suction contact plane). A packet has a valid
+  centered PLACEMENT (the plate centered on it) if some IK solution (over several seeds)
+  meets ALL of:
+      (1) the SUCTION FACE lands on the packet center (FK error < FK_TOL),
       (2) the tool stays parallel to the ground (tilt < TILT_CONE_DEG + ORI_TOL_DEG),
       (3) the solution is within joint limits,
       (4) no robot link penetrates the bin walls/floor,
       (5) the arm does not collide with itself,
       (6) the gripper body does not penetrate the walls (corner/edge clearance; with
           vertical walls this also implies clearance for the straight-down descent).
-  A point is COVERED (the reported metric) if it falls under the foam footprint of ANY
-  valid placement -- not only the placement centered on it. So an area vacuum gripper
-  can pick a point near a wall by sitting the plate inward, with the point under the
-  plate's edge. Coverage = the placement grid DILATED by the plate footprint (per
-  clocking, within each depth layer); with no tool it collapses to the placements.
+  A packet is PICKABLE (the reported metric) if some reachable, collision-free, level
+  placement covers enough of it: at least PACKET_CONTACT_FRAC of the packet's top face
+  is under the foam face (the tool bottom) -- not only when the plate is centered on it.
+  So an area vacuum gripper picks a packet near a wall by sitting the plate inward, as
+  long as >= that fraction of the packet still sits under the foam.
+  Pickability = the reachable-center grid DILATED by the set of contact-satisfying
+  packet offsets (per clocking, within each depth layer); with no tool it collapses to
+  the centered placements.
 - Reports the top-N base poses by coverage (run() returns them as an array) AND the
   "best of different sections": high-coverage mounts that are far apart in base-pose
   space (a quality-diversity view -- different mounts that work about as well, like
@@ -141,11 +146,32 @@ BASE_Z_RANGE = MOUNT_HEIGHT + np.linspace(-0.40, 0.40, 11)  # mount heights to t
 # headings. Set to [0.0] to disable the yaw search.
 BASE_YAW_RANGE = np.deg2rad(np.linspace(0.0, 90.0, 4))   # [0, 30, 60, 90] deg
 
-# Target sampling inside the bin. Finer = sharper reachability map but the sweep cost
-# scales linearly with the point count (N_X*N_Y*N_Z). 10x10x6 = 600 points (~0.11 m
-# spacing); was 6x6x4 = 144. Runtime grows ~proportionally (so ~4x vs the old grid).
-N_X, N_Y, N_Z = 10, 10, 6        # grid resolution of pick targets (600 points)
-MARGIN = 0.06                    # keep targets this far inside the walls/floor
+# Target sampling inside the bin. Each grid point is the CENTER of a packet (see
+# below). Finer = sharper reachability map but the sweep cost scales linearly with the
+# packet count (N_X*N_Y*N_Z). 10x10x6 = 600 packets (~0.11 m spacing); was 6x6x4 = 144.
+# Runtime grows ~proportionally (so ~4x vs the old grid).
+N_X, N_Y, N_Z = 10, 10, 6        # grid resolution of pick targets (600 packet centers)
+MARGIN = 0.06                    # keep packet centers this far inside the walls/floor
+
+# ----------------------------------------------------------------------------
+# Packets -- the actual parts being picked (replaces abstract point targets)
+# ----------------------------------------------------------------------------
+# Every grid target is the CENTER of a real packet: an axis-aligned rectangular box
+# resting in the bin with its TOP face at the target's z (the suction contact plane).
+# Real packets vary in size, so the dimensions are parameters; for now a single nominal
+# size is used for every packet. (To make them genuinely variable later, draw a size
+# per packet and recompute the per-packet pickup offsets -- the contact test below is
+# already size-driven.) Nominal packet: 9.5 in x 13 in x 1.25 in.
+_IN = 0.0254                     # inches -> meters
+PACKET_L = 9.5  * _IN            # 0.2413 m, packet extent along world x
+PACKET_W = 13.0 * _IN            # 0.3302 m, packet extent along world y
+PACKET_H = 1.25 * _IN            # 0.0318 m, packet thickness (top face = pick plane)
+# A packet is pickable when the gripper can be placed (reachable, level, collision-free)
+# so that at least this fraction of the PACKET's top face is covered by (in contact
+# with) the TOOL BOTTOM -- the foam face, GRIPPER_LENGTH x GRIPPER_WIDTH -- i.e. enough
+# of the packet sits under the suction face to lift it. This replaces the old "foam
+# center exactly on the point" test with a real area-of-contact test on the packet.
+PACKET_CONTACT_FRAC = 0.60       # min overlap(tool bottom, packet top) / packet-top area
 
 # Tolerances
 FK_TOL        = 0.02     # m, how close the suction face must actually get to the target
@@ -328,7 +354,7 @@ def joint_limits(rid, joints):
     return lo, hi
 
 # ----------------------------------------------------------------------------
-# Target grid
+# Target grid -- each target is a PACKET CENTER; z is the packet-top contact plane.
 # ----------------------------------------------------------------------------
 def bin_targets():
     cx, cy = BIN_CENTER_XY
@@ -393,21 +419,23 @@ def _tool_tilt_deg(orn):
 def solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
                orientations, seeds):
     """The single source of truth for a CENTERED placement: "can the gripper be put
-    here with the foam-face center exactly on the target?" Returns the first valid
-    joint configuration (and its diagnostics, incl. `ori_idx` = which clocking won) as
-    a dict, or None. 'Valid' = the suction face center lands on the target with the
-    tool pointing down, in joint limits, and collision-free against the bin, the arm
-    itself, and the gripper body. Each seed is a different starting guess, so we
-    explore the arm's multiple IK solutions instead of trusting the single config one
-    IK call happens to return. Checks run cheapest-first and bail on the first failure.
+    here with the foam-face center exactly on the packet center (the target)?" Returns
+    the first valid joint configuration (and its diagnostics, incl. `ori_idx` = which
+    clocking won) as a dict, or None. 'Valid' = the suction face center lands on the
+    packet center with the tool pointing down, in joint limits, and collision-free
+    against the bin, the arm itself, and the gripper body. Each seed is a different
+    starting guess, so we explore the arm's multiple IK solutions instead of trusting
+    the single config one IK call happens to return. Checks run cheapest-first and bail
+    on the first failure.
 
-    A target is *covered* (the reported coverage metric) if it falls under the foam
-    footprint of ANY such collision-free placement, not only the one centered on it --
-    see `_covered_mask`. This function finds the placements; coverage dilates them.
+    A packet is *pickable* (the reported metric) if some such collision-free placement
+    -- not only the one centered on it -- covers >= PACKET_CONTACT_FRAC of the packet's
+    top face with the foam; see `_covered_mask`. This function finds the centered
+    placements; pickability dilates them by the contact offsets.
 
     Driving the animation and the data dump through this same function (rather than
     a separate IK call) is what makes them reproducible and consistent with the
-    reported coverage."""
+    reported pickability."""
     target = np.asarray(target, dtype=float)
     # The flange sits a stand-off above the suction contact point (0 if no tool).
     standoff = GRIPPER_STANDOFF if USE_GRIPPER else 0.0
@@ -488,48 +516,100 @@ def set_base(rid, base_xy, height, yaw=0.0):
         rid, [cx + base_xy[0], cy + base_xy[1], height], base_orientation(yaw))
 
 # ----------------------------------------------------------------------------
-# Area coverage: a target is COVERED if it falls under the foam footprint of any
-# collision-free placement -- not only the placement centered on it. We get this by
-# DILATING the reachable-center grid by the plate footprint (per clocking, within
-# each depth layer), so near-wall points the gripper can pick off-center count too.
+# Pickability: a PACKET is pickable if some reachable, collision-free, level
+# placement covers >= PACKET_CONTACT_FRAC of the PACKET's top face with the TOOL
+# BOTTOM (foam face) -- not only when the plate is centered on it. We get this by
+# DILATING the reachable-center grid by the set of contact-satisfying packet
+# offsets (per clocking, within each depth layer): for a tool centered at grid cell
+# C, every packet whose center sits at an offset that keeps >= the required fraction
+# of the packet under the foam is pickable from C. So near-wall packets the gripper
+# grips off-center count too, but only while enough of the packet stays under the foam.
 # ----------------------------------------------------------------------------
-def _footprint_offsets(ang, dx, dy, L, W):
-    """Grid (di, dj) index offsets in x/y whose world displacement (di*dx, dj*dy)
-    from a plate center lies under the L x W footprint clocked by `ang` (the plate's
-    long axis heading in world). A center at (ix,iy) therefore covers (ix+di, iy+dj)."""
-    if dx <= 0 or dy <= 0 or (L <= 0 and W <= 0):
-        return [(0, 0)]
+def _rect_poly(cx, cy, ang, L, W):
+    """CCW corner list of an L x W rectangle centered at (cx, cy) with its L-axis at
+    heading `ang` (radians) in the world XY plane."""
     c, s = math.cos(ang), math.sin(ang)
-    rmax = max(L, W) / 2.0
-    nx, ny = int(rmax / dx), int(rmax / dy)
+    hl, hw = L / 2.0, W / 2.0
+    local = [(hl, -hw), (hl, hw), (-hl, hw), (-hl, -hw)]   # CCW
+    return [(cx + c * x - s * y, cy + s * x + c * y) for x, y in local]
+
+def _convex_intersect_area(subject, clip):
+    """Area of the intersection of two convex polygons given CCW, via Sutherland-
+    Hodgman clipping + the shoelace formula. Returns 0.0 if they don't overlap.
+    Exact for the rotated tool footprint vs the axis-aligned packet at any clocking."""
+    def inside(pt, a, b):                       # left of directed edge a->b => inside (CCW)
+        return (b[0] - a[0]) * (pt[1] - a[1]) - (b[1] - a[1]) * (pt[0] - a[0]) >= -1e-12
+    def inter(s, e, a, b):                      # intersection of segment s-e with line a-b
+        x1, y1 = s; x2, y2 = e; x3, y3 = a; x4, y4 = b
+        d = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+        if abs(d) < 1e-15:
+            return e
+        t = ((x1 - x3) * (y3 - y4) - (y1 - y3) * (x3 - x4)) / d
+        return (x1 + t * (x2 - x1), y1 + t * (y2 - y1))
+    out = list(subject)
+    for i in range(len(clip)):
+        a, b = clip[i], clip[(i + 1) % len(clip)]
+        inp, out = out, []
+        if not inp:
+            break
+        s = inp[-1]
+        for e in inp:
+            if inside(e, a, b):
+                if not inside(s, a, b):
+                    out.append(inter(s, e, a, b))
+                out.append(e)
+            elif inside(s, a, b):
+                out.append(inter(s, e, a, b))
+            s = e
+    if len(out) < 3:
+        return 0.0
+    area = 0.0
+    for i in range(len(out)):
+        x1, y1 = out[i]; x2, y2 = out[(i + 1) % len(out)]
+        area += x1 * y2 - x2 * y1
+    return abs(area) * 0.5
+
+def _pickup_offsets(ang, dx, dy):
+    """Grid (di, dj) index offsets such that a packet whose center is displaced
+    (di*dx, dj*dy) from a tool centered at the origin (its foam face clocked by `ang`)
+    is gripped -- at least PACKET_CONTACT_FRAC of the packet top (PACKET_L x PACKET_W,
+    axis-aligned) is covered by the tool bottom (GRIPPER_LENGTH x GRIPPER_WIDTH). A
+    reachable tool center at (ix,iy) therefore picks the packet at (ix+di, iy+dj).
+    Empty if no offset can meet the contact fraction (e.g. the tool is too small)."""
+    if not USE_GRIPPER or dx <= 0 or dy <= 0:    # bare flange: only the centered packet
+        return [(0, 0)]
+    tool = _rect_poly(0.0, 0.0, ang, GRIPPER_LENGTH, GRIPPER_WIDTH)
+    need = PACKET_CONTACT_FRAC * PACKET_L * PACKET_W
+    # search window: packets farther than half the (tool + packet) span can't overlap
+    span = max(GRIPPER_LENGTH, GRIPPER_WIDTH) / 2.0
+    nx = int((span + PACKET_L / 2.0) / dx) + 1
+    ny = int((span + PACKET_W / 2.0) / dy) + 1
     offs = []
     for di in range(-nx, nx + 1):
         for dj in range(-ny, ny + 1):
-            wx, wy = di * dx, dj * dy
-            along =  c * wx + s * wy        # projection on the plate long (L) axis
-            across = -s * wx + c * wy       # projection on the plate short (W) axis
-            if abs(along) <= L / 2 + 1e-9 and abs(across) <= W / 2 + 1e-9:
+            pkt = _rect_poly(di * dx, dj * dy, 0.0, PACKET_L, PACKET_W)
+            if _convex_intersect_area(tool, pkt) >= need - 1e-12:
                 offs.append((di, dj))
     return offs
 
 def _cover_offsets(orientations, dx, dy):
-    """Footprint offsets for each clocking in `orientations` (index-aligned). With no
-    tool, every clocking covers just its own cell."""
+    """Pickup offsets for each clocking in `orientations` (index-aligned). With no
+    tool, every clocking picks only the packet centered under the flange."""
     if not USE_GRIPPER:
         return [[(0, 0)] for _ in orientations]
     offs = []
     for ori in orientations:
         m = p.getMatrixFromQuaternion(ori)         # plate long axis (local x) in world
         ang = math.atan2(m[3], m[0])
-        offs.append(_footprint_offsets(ang, dx, dy, GRIPPER_LENGTH, GRIPPER_WIDTH))
+        offs.append(_pickup_offsets(ang, dx, dy))
     return offs
 
 def _dilate_layerwise(mask3, offsets):
     """OR-dilate a (N_Z, N_Y, N_X) center mask by grid offsets, within each depth
-    layer only (the foam footprint is horizontal at the target's depth)."""
+    layer only (the foam face and the packet tops are horizontal at the layer depth)."""
     out = np.zeros_like(mask3)
     nz, ny, nx = mask3.shape
-    for di, dj in offsets:                          # center (ix,iy) -> covers (ix+di,iy+dj)
+    for di, dj in offsets:                          # tool center (ix,iy) -> picks packet (ix+di,iy+dj)
         xd0, xd1 = max(0, di), nx + min(0, di)
         yd0, yd1 = max(0, dj), ny + min(0, dj)
         out[:, yd0:yd1, xd0:xd1] |= mask3[:, max(0, -dj):ny + min(0, -dj),
@@ -537,8 +617,9 @@ def _dilate_layerwise(mask3, offsets):
     return out
 
 def _covered_mask(center_by_clk, cover_offsets):
-    """Union over clockings of the dilated reachable-center masks -> covered grid
-    (flat, target order). center_by_clk[k] is the centers reachable at clocking k."""
+    """Union over clockings of the dilated reachable-center masks -> the PICKABLE
+    packet grid (flat, target order). center_by_clk[k] is the centers reachable at
+    clocking k; each picks every packet within a contact-satisfying offset of it."""
     covered = np.zeros(center_by_clk.shape[1], dtype=bool)
     cov3 = covered.reshape(N_Z, N_Y, N_X)           # view; writes hit `covered`
     for k in range(center_by_clk.shape[0]):
@@ -575,11 +656,12 @@ def _worker_init():
     _W = build_world()
 
 def _eval_pose(args):
-    """Evaluate one base pose -> (pose_idx, covered_mask, center_mask). center_mask =
-    grid points where the plate CAN be centered collision-free; covered_mask = points
-    that fall under the footprint of some such placement (center_mask dilated by the
-    plate). Coverage is reported from covered_mask; center_mask drives the animation
-    and the joint-config dump (those are the real, achievable arm poses)."""
+    """Evaluate one base pose -> (pose_idx, pickable_mask, center_mask). center_mask =
+    packets whose center the plate CAN be placed on collision-free; pickable_mask =
+    packets a reachable placement covers >= PACKET_CONTACT_FRAC of (under the foam;
+    center_mask dilated by the contact offsets). Coverage is reported from
+    pickable_mask; center_mask drives the animation and the joint-config dump (those
+    are the real, achievable arm poses)."""
     pose_idx, bx, by, bz, byaw = args
     w = _W
     set_base(w["rid"], (bx, by), bz, byaw)
@@ -692,7 +774,7 @@ def _sweep_gui(targets, poses, meta, total):
             f"base   x={bx:+.2f}  y={by:+.2f}  z={bz:.2f} m  "
             f"yaw={math.degrees(byaw):+.0f}deg",
             f"coverage here:   {cov*100:4.1f}%   "
-            f"({int(covered.sum())}/{len(targets)} covered)",
+            f"({int(covered.sum())}/{len(targets)} pickable)",
             f"best so far:   {best['cov']*100:4.1f}%   "
             f"@ x={best['xy'][0]:+.2f} y={best['xy'][1]:+.2f} "
             f"z={best['z']:.2f} yaw={math.degrees(best['yaw']):+.0f}",
@@ -856,7 +938,7 @@ def plot_coverage_grid(coverage, best):
     return path
 
 def plot_best_slices(best, xs, ys, zs):
-    """Covered pick points at the best base, sliced by depth, with the
+    """Pickable packets at the best base, sliced by depth, with the
     bin outline, the sample grid ticks, and per-slice counts."""
     mask = best["mask"].reshape(N_Z, N_Y, N_X)
     extent = _cell_extent(xs, ys)
@@ -871,15 +953,16 @@ def plot_best_slices(best, xs, ys, zs):
         for lbl in a.get_xticklabels():
             lbl.set_rotation(90)
         n_ok, n_tot = int(mask[k].sum()), mask[k].size
-        a.set_title(f"z = {zs[k]:.2f} m\n{n_ok}/{n_tot} covered "
+        a.set_title(f"z = {zs[k]:.2f} m\n{n_ok}/{n_tot} pickable "
                     f"({mask[k].mean()*100:.0f}%)", fontsize=9)
         a.set_xlabel("x (m)")
         if k == 0:
             a.set_ylabel("y (m)")
-    fig.suptitle(f"Covered pick points by depth at best base  "
+    fig.suptitle(f"Pickable packets by depth at best base  "
                  f"(x={best['xy'][0]:+.2f}, y={best['xy'][1]:+.2f}, "
                  f"z={best['z']:.2f} m, yaw={math.degrees(best['yaw']):+.0f}deg)   "
-                 f"green = covered (foam can reach it), red = not", fontsize=11)
+                 f"green = pickable ({PACKET_CONTACT_FRAC*100:.0f}% of packet under "
+                 f"foam), red = not", fontsize=11)
     fig.tight_layout()
     path = os.path.join(RUN_DIR, "best_pos_slices.png")
     fig.savefig(path, dpi=130)
@@ -899,7 +982,7 @@ def _draw_bin_wireframe(ax):
         ax.plot([xx, xx], [yy, yy], [z0, z1], c="gray", lw=1.0)
 
 def plot_reach_3d(best, targets):
-    """3D scatter of covered vs not-covered pick points at the best base,
+    """3D scatter of pickable vs not-pickable packets at the best base,
     with the bin drawn as a wireframe and the robot base marked."""
     reach = targets[best["mask"]]
     miss = targets[~best["mask"]]
@@ -908,14 +991,14 @@ def plot_reach_3d(best, targets):
     _draw_bin_wireframe(ax)
     if len(miss):
         ax.scatter(miss[:, 0], miss[:, 1], miss[:, 2], c="red", marker="x",
-                   s=30, alpha=0.6, label=f"not covered ({len(miss)})")
+                   s=30, alpha=0.6, label=f"not pickable ({len(miss)})")
     if len(reach):
         ax.scatter(reach[:, 0], reach[:, 1], reach[:, 2], c="green", marker="o",
-                   s=35, alpha=0.9, label=f"covered ({len(reach)})")
+                   s=35, alpha=0.9, label=f"pickable ({len(reach)})")
     ax.scatter([best["xy"][0]], [best["xy"][1]], [best["z"]], c="black",
                marker="^", s=130, label=f"robot base (z={best['z']:.2f} m)")
     ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)"); ax.set_zlabel("z (m)")
-    ax.set_title(f"Covered pick points in 3D at best base  "
+    ax.set_title(f"Pickable packets in 3D at best base  "
                  f"({best['cov']*100:.1f}% coverage)")
     ax.legend(loc="upper left", fontsize=8)
     ax.view_init(elev=22, azim=-60)
@@ -949,7 +1032,7 @@ def plot_coverage_vs_height(coverage):
     return path
 
 def plot_target_frequency(target_freq, xs, ys, zs):
-    """For every pick point, the % of all swept base positions that can reach
+    """For every packet position, the % of all swept base positions that can pick
     it -- highlights bin regions that are intrinsically hard, sliced by depth."""
     freq = target_freq.reshape(N_Z, N_Y, N_X) * 100
     extent = _cell_extent(xs, ys)
@@ -969,8 +1052,8 @@ def plot_target_frequency(target_freq, xs, ys, zs):
         a.set_xlabel("x (m)")
         if k == 0:
             a.set_ylabel("y (m)")
-    fig.suptitle("Target coverage across ALL base positions "
-                 "(% of swept bases whose foam can reach each point)", fontsize=11)
+    fig.suptitle("Packet pickability across ALL base positions "
+                 "(% of swept bases that can pick each packet)", fontsize=11)
     fig.colorbar(im, ax=axes.ravel().tolist(), label="% of bases")
     path = os.path.join(RUN_DIR, "target_reachability.png")
     fig.savefig(path, dpi=130)
@@ -981,10 +1064,11 @@ def plot_target_frequency(target_freq, xs, ys, zs):
 # Detailed data dump + reproducible end animation (run after every sweep)
 # ----------------------------------------------------------------------------
 def _pick_records(world, base, targets, covered):
-    """Per-target detail for one base pose. `covered` marks points the foam footprint
-    reaches (the reported metric). Each target is also re-solved with solve_pick (the
-    same deterministic logic as the sweep) to flag the points where the plate can be
-    CENTERED -- a real placement -- and log its joint solution / FK error / tool tilt."""
+    """Per-packet detail for one base pose. `covered` marks the PICKABLE packets (the
+    reported metric: a placement puts >= PACKET_CONTACT_FRAC of the packet under foam).
+    Each packet is also re-solved with solve_pick (the same deterministic logic as the
+    sweep) to flag the ones where the plate can be CENTERED -- a real placement -- and
+    log its joint solution / FK error / tool tilt. `target_m` is the packet center."""
     set_base(world["rid"], base["xy"], base["z"], base["yaw"])
     recs = []
     for t, cov in zip(targets, covered):
@@ -992,7 +1076,7 @@ def _pick_records(world, base, targets, covered):
                          world["ee"], world["joints"], world["lo"], world["hi"],
                          t, world["orientations"], world["seeds"])
         rec = {"target_m": [round(float(v), 4) for v in t],
-               "covered": bool(cov), "is_placement": sol is not None}
+               "pickable": bool(cov), "is_placement": sol is not None}
         if sol is not None:
             rec["joints_rad"] = [round(q, 5) for q in sol["joints"]]
             rec["joints_deg"] = [round(math.degrees(q), 2) for q in sol["joints"]]
@@ -1006,13 +1090,13 @@ def _pick_records(world, base, targets, covered):
     return recs
 
 def _best_block(world, b, rank, targets, zs):
-    """One base pose's full record (summary + per-depth COVERED counts + every pick's
-    covered/placement flags and joint solution) plus its (n_targets x n_joints) joint
+    """One base pose's full record (summary + per-depth PICKABLE counts + every packet's
+    pickable/placement flags and joint solution) plus its (n_targets x n_joints) joint
     array for the NPZ (filled at the centered placements)."""
     recs = _pick_records(world, b, targets, b["mask"])
     mask3 = b["mask"].reshape(N_Z, N_Y, N_X)
     per_depth = [{"z_m": round(float(zs[k]), 3),
-                  "covered": int(mask3[k].sum()),
+                  "pickable": int(mask3[k].sum()),
                   "total": int(mask3[k].size),
                   "pct": round(float(mask3[k].mean()) * 100, 1)}
                  for k in range(N_Z)]
@@ -1023,7 +1107,7 @@ def _best_block(world, b, rank, targets, zs):
                  "z": round(float(b["z"]), 4),
                  "yaw_deg": round(math.degrees(b["yaw"]), 2)},
         "coverage_pct": round(b["cov"] * 100, 2),
-        "covered": int(b["mask"].sum()), "total": int(b["mask"].size),
+        "pickable": int(b["mask"].sum()), "total": int(b["mask"].size),
         "placements": int(b["center_mask"].sum()),
         "per_depth": per_depth,
         "picks": recs,
@@ -1060,6 +1144,13 @@ def dump_best_data(world, bests, diverse, targets, coverage, target_freq):
         "robot_urdf": os.path.basename(ROBOT_URDF),
         "bin_LxWxD_m": [BIN_L, BIN_W, BIN_DEPTH],
         "gripper": gripper_cfg,
+        "packet": {"length_m": PACKET_L, "width_m": PACKET_W, "height_m": PACKET_H,
+                   "length_in": round(PACKET_L / _IN, 3),
+                   "width_in": round(PACKET_W / _IN, 3),
+                   "height_in": round(PACKET_H / _IN, 3),
+                   "contact_frac": PACKET_CONTACT_FRAC,
+                   "note": "axis-aligned box, top face at the target z; pickable when "
+                           ">= contact_frac of the packet top is covered by the tool bottom"},
         "tolerances": {"fk_tol_m": FK_TOL, "collide_tol_m": COLLIDE_TOL,
                        "tilt_cone_deg": TILT_CONE_DEG, "ori_tol_deg": ORI_TOL_DEG,
                        "reach_max_m": REACH_MAX},
@@ -1078,14 +1169,14 @@ def dump_best_data(world, bests, diverse, targets, coverage, target_freq):
     for r, b in enumerate(bests, 1):
         block, jc = _best_block(world, b, r, targets, zs)
         top_blocks.append(block)
-        npz[f"best{r}_covered_mask"] = b["mask"]
+        npz[f"best{r}_pickable_mask"] = b["mask"]
         npz[f"best{r}_center_mask"] = b["center_mask"]
         npz[f"best{r}_joints_rad"] = jc
     diverse_blocks = []
     for r, b in enumerate(diverse, 1):
         block, jc = _best_block(world, b, r, targets, zs)
         diverse_blocks.append(block)
-        npz[f"diverse{r}_covered_mask"] = b["mask"]
+        npz[f"diverse{r}_pickable_mask"] = b["mask"]
         npz[f"diverse{r}_center_mask"] = b["center_mask"]
         npz[f"diverse{r}_joints_rad"] = jc
     bundle = {
@@ -1103,16 +1194,18 @@ def dump_best_data(world, bests, diverse, targets, coverage, target_freq):
     return jpath
 
 def _add_target_markers(targets, mask):
-    """Visual-only spheres (green=reachable, red=not) so they show up in the
-    rendered animation (debug points/lines are not captured by getCameraImage)."""
+    """Visual-only PACKET boxes (green=pickable, red=not) so they show up in the
+    rendered animation (debug points/lines are not captured by getCameraImage). Each
+    box is the packet footprint with its TOP face at the target z (the pick plane)."""
+    he = [PACKET_L / 2, PACKET_W / 2, PACKET_H / 2]
     ids = []
     for t, ok in zip(targets, mask):
         color = [0.1, 0.9, 0.2, 1] if ok else [0.9, 0.15, 0.15, 1]
-        vis = p.createVisualShape(p.GEOM_SPHERE, radius=0.018, rgbaColor=color)
+        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=he, rgbaColor=color)
         ids.append(p.createMultiBody(baseMass=0, baseCollisionShapeIndex=-1,
                                      baseVisualShapeIndex=vis,
                                      basePosition=[float(t[0]), float(t[1]),
-                                                   float(t[2])]))
+                                                   float(t[2]) - PACKET_H / 2]))
     return ids
 
 def render_animation(world, best, targets):
@@ -1122,8 +1215,8 @@ def render_animation(world, best, targets):
     os.makedirs(RUN_DIR, exist_ok=True)
     rid = world["rid"]
     set_base(rid, best["xy"], best["z"], best["yaw"])
-    # markers: green = covered (the reported metric); the arm visits the real
-    # collision-free plate placements (center_mask), which cover that whole region.
+    # markers: green = pickable packets (the reported metric); the arm visits the real
+    # collision-free centered placements (center_mask), which pick that whole region.
     _add_target_markers(targets, best["mask"])
     reach_pts = targets[best.get("center_mask", best["mask"])]
     view = p.computeViewMatrixFromYawPitchRoll(

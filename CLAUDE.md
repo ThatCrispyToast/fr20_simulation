@@ -5,12 +5,13 @@ Guidance for working in this repo. See `README.md` for the user-facing overview.
 ## What this is
 
 A single-file feasibility study: can an overhead-mounted Fairino **FR20** arm with a
-**flat vacuum gripper** reach into a pallet bin to pick parts, and where should it be
-mounted? It sweeps base poses (XYZ + yaw), tests a grid of pick targets in the bin via
-seeded inverse kinematics + collision checks, and reports the top-N mount poses with
-coverage heatmaps, a data bundle, and a rendered animation.
+**flat vacuum gripper** reach into a pallet bin to pick **packets**, and where should
+it be mounted? It sweeps base poses (XYZ + yaw), fills the bin with a grid of packets
+(rectangular boxes, default 9.5×13×1.25 in), tests each via seeded inverse kinematics +
+collision checks + a foam-contact test, and reports the top-N mount poses with coverage
+heatmaps, a data bundle, and a rendered animation.
 
-Everything lives in **`src/bin_reach.py`** (~990 lines). There is no package structure
+Everything lives in **`src/bin_reach.py`** (~1000 lines). There is no package structure
 and no test suite — verification is done by running the script (see below).
 
 ## Layout
@@ -75,20 +76,32 @@ Module-level CONFIG names are read at call time, so overriding `m.<NAME>` before
    with `build_world(force_gui=True)` after swapping out the DIRECT one).
 
 The reachability core:
+- **Targets are PACKETS, not points.** Each grid target is the *center* of an
+  axis-aligned packet box (`PACKET_L/W/H`, default 9.5×13×1.25 in) whose **top face**
+  is at the target z (the suction contact plane). The old abstract point target is
+  gone; `target_m` is now a packet center.
 - **`solve_pick()` is the single source of truth for a *centered placement*.** It
   returns the actual joint config (or `None`) after all gates: suction-face center on
-  the point, tool tilt, joint limits, and collisions (bin, self, gripper), plus
+  the packet center, tool tilt, joint limits, and collisions (bin, self, gripper), plus
   `ori_idx` = which clocking won. `reachable()` is just `solve_pick(...) is not None`.
-- **Coverage ≠ placement.** A point is *covered* if it lies under the foam footprint of
-  ANY collision-free placement, not only the one centered on it (so an area gripper
-  picks near-wall points off-center). `_eval_pose` builds the per-clocking *center*
-  masks from `solve_pick`, then `_covered_mask` dilates them by the plate footprint
-  (`_cover_offsets` / `_dilate_layerwise`, per clocking, within each depth layer). It
-  returns `(covered_mask, center_mask)`: **coverage/plots/`target_freq` use `covered`**;
-  the **animation and JSON joint configs use `center_mask`** (the real, achievable
-  placements). Each `ranked`/best dict carries both `mask` (covered) and `center_mask`.
-  Dilation keeps the early-out in `solve_pick` (no extra IK) and is conservative when a
-  center is reachable at multiple clockings (credits only the clocking that won).
+  (The packet itself is **not** a collision body — the foam is meant to land on it.)
+- **Pickable ≠ centered placement.** A packet is *pickable* (the reported metric, still
+  stored in the `mask`/`covered` variables) if some collision-free placement — not only
+  the one centered on it — covers at least `PACKET_CONTACT_FRAC` of the **packet's top**
+  with the **tool bottom** (foam face). `_eval_pose` builds the per-clocking *center* masks
+  from `solve_pick`, then `_covered_mask` dilates them by the **contact offsets** from
+  `_cover_offsets` → `_pickup_offsets` (per clocking, within each depth layer). The
+  offsets are the (di,dj) grid steps where a packet that far from a centered tool still
+  has ≥ PACKET_CONTACT_FRAC of its top under the foam (overlap ÷ **packet** area),
+  computed by exact convex-polygon intersection
+  (`_rect_poly` / `_convex_intersect_area`) — this **replaced** the old point-under-
+  footprint `_footprint_offsets`. It returns `(pickable_mask, center_mask)`:
+  **coverage/plots/`target_freq` use the pickable mask**; the **animation and JSON joint
+  configs use `center_mask`** (the real, achievable placements). Each `ranked`/best dict
+  carries both `mask` (pickable) and `center_mask`. Dilation keeps the early-out in
+  `solve_pick` (no extra IK) and is conservative when a center is reachable at multiple
+  clockings (credits only the clocking that won). If no offset can meet the contact
+  fraction (e.g. a tiny packet), `_pickup_offsets` is empty and the packet is unpickable.
 
 ## Non-obvious invariants — read before editing
 
@@ -152,7 +165,8 @@ URDF/meshes — `file://` can't), and opens `viz/index.html?run=<rel-json>`.
   hang-down flip as `base_orientation()`), and the gripper plate reuses that quaternion
   clocked by `tool_yaw_deg`. The arm is the real FR20 via `urdf-loader` (joints `j1..j6`,
   flange = `wrist3_link`); playback drives `joints_rad` from the JSON `picks`, and the
-  gripper follows the FK flange. Targets are coloured by `is_placement` / `covered`.
+  gripper follows the FK flange. Packets are drawn as boxes coloured by `is_placement`
+  / `pickable` (the viewer reads `CFG.packet` dims; falls back to `covered` for old JSON).
 - Faithful plate clocking needs the `tool_yaw_deg` field that `_pick_records` now writes
   per placement; the viewer falls back to 0 for older JSON without it.
 - The viewer is **not** part of `run()` and writes nothing — keep the study self-contained.
