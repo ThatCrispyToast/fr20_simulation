@@ -7,6 +7,5 @@ requires-python = ">=3.13"
 dependencies = [
     "matplotlib>=3.11.0",
     "numpy>=2.4.6",
-    "plotly>=6.8.0",
     "pybullet>=3.2.7",
 ]

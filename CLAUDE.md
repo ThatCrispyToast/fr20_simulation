@@ -15,19 +15,8 @@ and no test suite — verification is done by running the script (see below).
 
 ## Layout
 
-- `src/bin_reach.py` — the entire simulation. All tunables are in the `CONFIG` block near
+- `src/bin_reach.py` — the entire program. All tunables are in the `CONFIG` block near
   the top; edit there, not in the functions.
-- `src/visualize_run.py` — a *separate* viewer. Reads a run's `best_versions.{json,npz}`
-  and writes/opens an interactive 3D `view.html` (Plotly; plotly.js inlined so it's
-  offline/self-contained), with a dropdown over the top-N and diverse poses. Renders the
-  bin, covered/placement points, the base, and the **FR20 arm** posed at a representative
-  placement — it imports `bin_reach` + PyBullet for FK and mesh placement (binary-STL
-  parse + dependency-free vertex-cluster decimation), but it only does forward kinematics,
-  never the sweep. **Click-to-pose:** each placement's joint config + the URDF kinematic
-  chain are embedded, and injected JS recomputes link transforms on click (chaining the
-  joint origins from the base pose — note `resetBasePositionAndOrientation` sets the base
-  *COM*, so a measured offset `toff` recovers the true URDF base frame; verified to match
-  `getLinkState` to <0.1 mm). `--no-arm` / `--arm-detail N` control the arm.
 - `resources/fairino20_v6.urdf` + `resources/fairino_description/` — robot model and
   meshes (extracted from `fairino20_v6_description.zip`). The URDF's `package://` paths
   resolve relative to `resources/` via `p.setAdditionalSearchPath` in `connect()`.
@@ -37,9 +26,8 @@ and no test suite — verification is done by running the script (see below).
 ## Run / verify
 
 ```bash
-uv sync                              # deps: pybullet, numpy, matplotlib, pillow, plotly
+uv sync                              # install deps (pybullet, numpy, matplotlib, pillow)
 uv run python src/bin_reach.py       # full run; writes out/run_<timestamp>/
-uv run python src/visualize_run.py   # interactive 3D view of the latest run
 ```
 
 Syntax check without running:

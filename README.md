@@ -135,36 +135,6 @@ blocks until you close the window or press `Ctrl-C`. Set `SHOW_BEST_AFTER = Fals
 for fully non-interactive/batch runs. (On a machine with no display the viewer is
 skipped with a message rather than failing.)
 
-## Interactive 3D web view
-
-A separate viewer turns a finished run's data bundle into a self-contained, orbitable
-3D HTML — no PyBullet, no re-running the sim:
-
-```bash
-uv run python src/visualize_run.py            # most recent out/run_*/
-uv run python src/visualize_run.py out/run_…  # a specific run
-uv run python src/visualize_run.py --no-open  # just write the HTML
-uv run python src/visualize_run.py --no-arm   # skip the arm meshes (smaller file)
-```
-
-It reads `best_versions.{json,npz}`, writes `view.html` into the run folder, and opens
-it in your browser. The scene shows the bin, the pick points (green = covered, faint red
-= not), the real plate **placements** (blue diamonds), the robot base, and the **FR20
-arm** posed at a representative placement; a dropdown flips between the top-N and the
-diverse base poses (the arm moves with the selection). Drag to orbit, scroll to zoom.
-The HTML inlines plotly.js, so it works offline and is easy to share.
-
-**Click any pick point to pose the arm there** — the viewer recomputes the FR20's joint
-configuration for the nearest reachable placement on the fly (client-side forward
-kinematics in the page) and snaps the arm to it, with the chosen pick highlighted. This
-makes it easy to see exactly how the arm reaches a given spot, or why a corner is only
-covered off-center. A **"show arm" checkbox** (top-right) toggles the arm meshes on/off
-so you can see the points unobstructed; the state sticks as you switch poses.
-
-To pose the arm it loads the URDF/meshes through PyBullet (forward kinematics only — it
-never re-runs the sweep) and decimates the link meshes for the web (`--arm-detail N`
-tunes the resolution, default 48; `--no-arm` drops them for a lighter file).
-
 ## Tuning
 
 Everything is in the `CONFIG` block of [src/bin_reach.py](src/bin_reach.py):
