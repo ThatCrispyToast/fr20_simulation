@@ -17,6 +17,8 @@ and no test suite — verification is done by running the script (see below).
 
 - `src/bin_reach.py` — the entire program. All tunables are in the `CONFIG` block near
   the top; edit there, not in the functions.
+- `src/serve_viz.py` + `viz/` — the optional browser viewer (see "3D viewer" below). It
+  only **consumes** `best_versions.json`; it does not run the study.
 - `resources/fairino20_v6.urdf` + `resources/fairino_description/` — robot model and
   meshes (extracted from `fairino20_v6_description.zip`). The URDF's `package://` paths
   resolve relative to `resources/` via `p.setAdditionalSearchPath` in `connect()`.
@@ -135,6 +137,25 @@ The reachability core:
 - **Coverage is a lower bound** (numerical IK has occasional false negatives) and
   **goal-pose only** (no arm-trajectory planning — only the gripper's vertical descent is
   implied). State these honestly; don't claim exact pickability.
+
+## 3D viewer (`viz/` + `src/serve_viz.py`)
+
+A standalone browser viewer for a finished run — independent of the study, reads only
+`best_versions.json`. `src/serve_viz.py` finds the newest `out/run_*` (or takes a run
+arg), serves the **repo root** over HTTP (so the page can `fetch` the JSON *and* the
+URDF/meshes — `file://` can't), and opens `viz/index.html?run=<rel-json>`.
+
+- `viz/index.html` — layout, control panel, and the importmap pinning three.js +
+  `urdf-loader` to a CDN (so the first load needs internet; run data/meshes are local).
+- `viz/app.js` — the scene. **Kept in the sim's native Z-up frame** (no axis
+  conversion) so poses match exactly: base orientation is `Rz(yaw)*Rx(pi)` (the same
+  hang-down flip as `base_orientation()`), and the gripper plate reuses that quaternion
+  clocked by `tool_yaw_deg`. The arm is the real FR20 via `urdf-loader` (joints `j1..j6`,
+  flange = `wrist3_link`); playback drives `joints_rad` from the JSON `picks`, and the
+  gripper follows the FK flange. Targets are coloured by `is_placement` / `covered`.
+- Faithful plate clocking needs the `tool_yaw_deg` field that `_pick_records` now writes
+  per placement; the viewer falls back to 0 for older JSON without it.
+- The viewer is **not** part of `run()` and writes nothing — keep the study self-contained.
 
 ## Performance
 

@@ -106,8 +106,30 @@ every run writes a timestamped folder `out/run_<timestamp>/` containing:
 - `coverage_vs_height.png` — best-base and mean coverage as a function of mount height
 - `target_reachability.png` — for every pick point, the % of all swept base positions whose foam can cover it (highlights intrinsically hard bin regions), sliced by depth
 - `best_pick_cycle.gif` — **reproducible** end animation of the best base driving the arm through its real plate **placements** (markers: green = covered, red = not), rendered offline so it's produced after every run (no GUI) and is byte-identical each time
-- `best_versions.json` — config snapshot plus, for each pose in **`top_bests`** and **`diverse_bests`**: coverage, per-depth counts, and **every point's** `covered`/`is_placement` flags with the joint solution (rad + deg), FK error, and tool tilt at each placement
+- `best_versions.json` — config snapshot plus, for each pose in **`top_bests`** and **`diverse_bests`**: coverage, per-depth counts, and **every point's** `covered`/`is_placement` flags with the joint solution (rad + deg), FK error, tool tilt, and the winning footprint clocking (`tool_yaw_deg`) at each placement
 - `best_versions.npz` — raw arrays: coverage grid, target frequency, target coords, and per top/diverse pose the covered mask, the centered-placement mask, and joint configs (NaN where not a placement)
+
+## Interactive 3D viewer (three.js)
+
+A browser viewer renders a run's `best_versions.json` in 3D: the bin, the
+**articulated FR20** (loaded from the URDF + STL meshes), the vacuum-gripper plate,
+and the swept pick targets coloured by outcome (green = a centered **placement**,
+amber = covered off-centre, red = not covered). Pick any reported base pose (top-N
+or diverse), slice the target grid by depth, toggle layers, and **play the arm
+through its real placements** — driven by the joint solutions in the JSON, so the
+poses match the study exactly.
+
+```bash
+uv run python src/serve_viz.py                 # newest out/run_* folder
+uv run python src/serve_viz.py out/run_xxxx     # a specific run
+uv run python src/serve_viz.py --port 8123 --no-browser
+```
+
+The launcher serves the repo over HTTP (browsers can't `fetch` the JSON/meshes
+from a `file://` page) and opens the viewer pointed at the run. The scene is kept
+in the simulator's native **Z-up** frame, so no axis conversion is needed. three.js
+and `urdf-loader` load from a CDN, so the first load needs internet access; the run
+data and meshes are served locally. Files live in [`viz/`](viz/).
 
 ## Watch the simulation
 

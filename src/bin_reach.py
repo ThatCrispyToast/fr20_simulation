@@ -998,6 +998,10 @@ def _pick_records(world, base, targets, covered):
             rec["joints_deg"] = [round(math.degrees(q), 2) for q in sol["joints"]]
             rec["fk_err_mm"] = round(sol["fk_err"] * 1000, 2)
             rec["tool_tilt_deg"] = round(sol["tilt_deg"], 2)
+            # Which footprint clocking won (deg about the vertical) -- lets a viewer
+            # draw the plate at the actual rotation it was placed at. 0 with no tool.
+            rec["tool_yaw_deg"] = (round(float(TOOL_YAW_DEG[sol["ori_idx"]]), 1)
+                                   if USE_GRIPPER else 0.0)
         recs.append(rec)
     return recs
 

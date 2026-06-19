@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>FR20 bin-reachability viewer</title>
+<style>
+  :root { --panel: #1b1e24f2; --ink: #e8ebf0; --muted: #9aa3b2;
+          --green: #1ae62a; --amber: #ffc83d; --red: #ff4d4d; --accent: #4da6ff; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+               font: 13px/1.45 system-ui, sans-serif; background: #0c0e12; color: var(--ink); }
+  #canvas-wrap { position: fixed; inset: 0; }
+  canvas { display: block; }
+
+  /* Control panel */
+  #panel { position: fixed; top: 12px; left: 12px; width: 288px; max-height: calc(100% - 24px);
+           overflow-y: auto; background: var(--panel); border: 1px solid #2c313b;
+           border-radius: 10px; padding: 14px; backdrop-filter: blur(4px); }
+  #panel h1 { font-size: 14px; margin: 0 0 2px; }
+  #panel .sub { color: var(--muted); font-size: 11px; margin-bottom: 12px; }
+  fieldset { border: 1px solid #2c313b; border-radius: 8px; margin: 0 0 12px; padding: 9px 10px; }
+  legend { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; padding: 0 4px; }
+  label { display: block; margin: 4px 0; cursor: pointer; }
+  select, button, input[type=range] { width: 100%; }
+  select, button { background: #20242c; color: var(--ink); border: 1px solid #343a45;
+                   border-radius: 6px; padding: 6px 8px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  .row { display: flex; gap: 6px; }
+  .row > * { flex: 1; }
+  .chk { display: inline-block; width: 11px; height: 11px; border-radius: 50%;
+         vertical-align: -1px; margin-right: 6px; }
+  .swatch-green { background: var(--green); }
+  .swatch-amber { background: var(--amber); }
+  .swatch-red   { background: var(--red); }
+  #readout { font-size: 11.5px; color: var(--muted); }
+  #readout b { color: var(--ink); font-weight: 600; }
+  #readout .big { color: var(--green); font-size: 15px; font-weight: 700; }
+  #depth-val { color: var(--ink); }
+  #status { position: fixed; bottom: 12px; left: 12px; color: var(--muted); font-size: 11px; }
+  #error { position: fixed; inset: 0; display: none; place-content: center; text-align: center;
+           padding: 40px; background: #0c0e12; }
+  #error code { background: #20242c; padding: 2px 6px; border-radius: 4px; color: var(--amber); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="canvas-wrap"></div>
+
+<div id="panel">
+  <h1>FR20 bin-reachability</h1>
+  <div class="sub" id="run-label">loading…</div>
+
+  <fieldset>
+    <legend>Base pose</legend>
+    <select id="pose-select"></select>
+    <div id="readout" style="margin-top:8px"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Playback (cycles real placements)</legend>
+    <div class="row">
+      <button id="btn-play">▶ Play</button>
+      <button id="btn-step">Step ›</button>
+    </div>
+    <label style="margin-top:8px">Speed <span id="speed-val">6</span> picks/s
+      <input id="speed" type="range" min="1" max="20" value="6" />
+    </label>
+    <div id="pick-info" style="font-size:11.5px;color:var(--muted)"></div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Show / hide</legend>
+    <label><input type="checkbox" id="t-place" checked>
+      <span class="chk swatch-green"></span>placements (plate centered)</label>
+    <label><input type="checkbox" id="t-cover" checked>
+      <span class="chk swatch-amber"></span>covered only (off-center)</label>
+    <label><input type="checkbox" id="t-miss" checked>
+      <span class="chk swatch-red"></span>not covered</label>
+    <label style="margin-top:6px"><input type="checkbox" id="t-arm" checked> robot arm</label>
+    <label><input type="checkbox" id="t-grip" checked> gripper plate</label>
+    <label><input type="checkbox" id="t-bin" checked> bin walls</label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Depth slice</legend>
+    <label>layer: <span id="depth-val">all</span>
+      <input id="depth" type="range" min="-1" max="0" value="-1" /></label>
+  </fieldset>
+</div>
+
+<div id="status">drag to orbit · scroll to zoom · right-drag to pan</div>
+
+<div id="error">
+  <div>
+    <h2>No run data</h2>
+    <p>Open this page through the launcher so it knows which run to load:</p>
+    <p><code>uv run python src/serve_viz.py</code></p>
+    <p class="sub" id="error-detail"></p>
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/examples/jsm/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+    "urdf-loader": "https://cdn.jsdelivr.net/npm/urdf-loader@0.12.1/src/URDFLoader.js"
+  }
+}
+</script>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
