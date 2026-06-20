@@ -16,10 +16,18 @@ and no test suite — verification is done by running the script (see below).
 
 ## Layout
 
-- `src/bin_reach.py` — the entire program. All tunables are in the `CONFIG` block near
-  the top; edit there, not in the functions.
+- `src/bin_reach.py` — the entire program (PACKET model). All tunables are in the
+  `CONFIG` block near the top; edit there, not in the functions.
+- `src/bin_reach_points.py` — a **separate, self-contained** copy that keeps the original
+  **POINT** model (abstract point targets; "covered" = point under the foam footprint of
+  any reachable placement; no packets, no contact fraction). It duplicates `bin_reach.py`
+  rather than sharing code — keep edits intentional, the two are meant to diverge. Both
+  write the same `best_versions.json` schema (the point one omits the `config.packet`
+  block and uses a `covered` per-pick field instead of `pickable`).
 - `src/serve_viz.py` + `viz/` — the optional browser viewer (see "3D viewer" below). It
-  only **consumes** `best_versions.json`; it does not run the study.
+  only **consumes** `best_versions.json` from EITHER sim; it auto-detects the model from
+  the JSON (`config.packet` present → packets as boxes, absent → points as spheres). It
+  does not run the study.
 - `resources/fairino20_v6.urdf` + `resources/fairino_description/` — robot model and
   meshes (extracted from `fairino20_v6_description.zip`). The URDF's `package://` paths
   resolve relative to `resources/` via `p.setAdditionalSearchPath` in `connect()`.
@@ -171,10 +179,23 @@ URDF/meshes — `file://` can't), and opens `viz/index.html?run=<rel-json>`.
   hang-down flip as `base_orientation()`), and the gripper plate reuses that quaternion
   clocked by `tool_yaw_deg`. The arm is the real FR20 via `urdf-loader` (joints `j1..j6`,
   flange = `wrist3_link`); playback drives `joints_rad` from the JSON `picks`, and the
-  gripper follows the FK flange. Packets are drawn as boxes coloured by `is_placement`
-  / `pickable` (the viewer reads `CFG.packet` dims; falls back to `covered` for old JSON).
-- Faithful plate clocking needs the `tool_yaw_deg` field that `_pick_records` now writes
-  per placement; the viewer falls back to 0 for older JSON without it.
+  gripper follows the FK flange. Targets are coloured by `is_placement` / pickable.
+- **Dual model:** `POINT_MODE = !CFG.packet`. Packet runs (`config.packet` present) draw
+  each target as a **box** sized from `CFG.packet`, top face at the target z, flagged by
+  `pickable`; point runs (no `config.packet`) draw a small **sphere** at the target,
+  flagged by `covered`. `classOf` reads whichever of `pickable`/`covered` exists, and the
+  legend/readout wording switches on `POINT_MODE`. `setTargetPos` handles the z offset
+  (box center = z − h/2; point sits at z).
+- **Packed view** (`t-packed`, packet mode only): the grid is sampled ~2.5–3.3× finer than
+  a packet, so drawing every cell's box overlaps. `STEP_X/STEP_Y = ceil(packet / pitch)`
+  (pitch read from the run's first pose) and `applyFilters` shows only every STEP-th cell
+  so the real-size boxes sit ≥ one packet apart — a realistic non-overlapping packed-bin
+  layout, each box still coloured by its own computed pickability. This is **display only**;
+  the sim's fine grid (the correct, finest pick test) is unchanged — coarsening the *sim*
+  to packet pitch would undercount near-wall off-center picks. Toggle off for the full
+  sampled field (boxes overlap).
+- Faithful plate clocking needs the `tool_yaw_deg` field both sims write per placement;
+  the viewer falls back to 0 for older JSON without it.
 - The viewer is **not** part of `run()` and writes nothing — keep the study self-contained.
 
 ## Performance

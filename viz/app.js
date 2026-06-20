@@ -65,6 +65,8 @@ window.addEventListener('resize', () => {
 let CFG = null;                 // config block from the JSON
 let GRID = null;                // {nx, ny, nz}
 let PKT = null;                 // packet dims {length_m, width_m, height_m}
+let POINT_MODE = false;         // true = original point sim (no config.packet): draw spheres
+let STEP_X = 1, STEP_Y = 1;     // packed-view stride (grid cells per packet) so boxes don't overlap
 let poses = [];                 // [{label, ...best_block}]
 let robot = null;               // URDFRobot
 let gripper = null;             // THREE.Group (post + plate)
@@ -158,36 +160,49 @@ function placeGripper(toolYawDeg) {
 }
 
 // ---------------------------------------------------------------------------
-// Packets: one box per grid target (600), coloured by outcome. Each is a real
-// packet resting in the bin (top face at target z, the pick plane). Kept
-// index-aligned to pose.picks so depth slicing and playback are simple lookups.
+// Targets: one mesh per grid target (600), coloured by outcome. In the packet sim
+// each is a real packet drawn as a BOX (top face at target z, the pick plane); in
+// the original point sim each is a SPHERE at the point. Kept index-aligned to
+// pose.picks so depth slicing and playback are simple lookups.
 // ---------------------------------------------------------------------------
 function classOf(pick) {
   if (pick.is_placement) return 'place';
-  // `pickable` is the current field; fall back to `covered` for older JSON.
+  // `pickable` (packet sim) or `covered` (point sim) -- whichever the JSON has.
   const ok = pick.pickable !== undefined ? pick.pickable : pick.covered;
   return ok ? 'cover' : 'miss';
 }
 function depthOf(i) { return Math.floor(i / (GRID.nx * GRID.ny)); }  // z-major order
 
+// Place a target mesh at its world position: a point sits AT target z; a packet box
+// sits with its TOP at target z (so its center is half a thickness below).
+function setTargetPos(mesh, x, y, z) {
+  mesh.position.set(x, y, POINT_MODE ? z : z - PKT.height_m / 2);
+}
+
 function buildTargets(pose) {
   for (const m of targetMeshes) { scene.remove(m); m.geometry.dispose(); m.material.dispose(); }
   targetMeshes = [];
-  const geo = new THREE.BoxGeometry(PKT.length_m, PKT.width_m, PKT.height_m);
-  pose.picks.forEach((pick) => {
+  const geo = POINT_MODE
+    ? new THREE.SphereGeometry(0.018, 12, 8)
+    : new THREE.BoxGeometry(PKT.length_m, PKT.width_m, PKT.height_m);
+  pose.picks.forEach((pick, idx) => {
     const cls = classOf(pick);
     const mat = new THREE.MeshStandardMaterial({
-      color: COL[cls], transparent: true, opacity: 0.85, roughness: 0.8 });
+      color: COL[cls], transparent: !POINT_MODE, opacity: POINT_MODE ? 1.0 : 0.85,
+      roughness: 0.8 });
     const m = new THREE.Mesh(geo, mat);
-    const [x, y, z] = pick.target_m;              // z = packet top -> box center is z - h/2
-    m.position.set(x, y, z - PKT.height_m / 2);
+    setTargetPos(m, ...pick.target_m);
     m.userData.cls = cls;
+    m.userData.ix = idx % GRID.nx;                 // grid column / row (z-major order)
+    m.userData.iy = Math.floor(idx / GRID.nx) % GRID.ny;
     scene.add(m);
     targetMeshes.push(m);
   });
-  if (!cursor) {                                  // wireframe box highlighting the active packet
-    cursor = new THREE.Mesh(
-      new THREE.BoxGeometry(PKT.length_m * 1.06, PKT.width_m * 1.06, PKT.height_m * 1.06),
+  if (!cursor) {                                  // wireframe highlight on the active target
+    const cgeo = POINT_MODE
+      ? new THREE.SphereGeometry(0.03, 16, 12)
+      : new THREE.BoxGeometry(PKT.length_m * 1.06, PKT.width_m * 1.06, PKT.height_m * 1.06);
+    cursor = new THREE.Mesh(cgeo,
       new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true }));
     cursor.visible = false;
     scene.add(cursor);
@@ -202,8 +217,14 @@ function applyFilters() {
     miss: document.getElementById('t-miss').checked,
   };
   const layer = parseInt(document.getElementById('depth').value, 10);  // -1 = all
+  // "Packed view": the grid is sampled finer than a packet, so drawing every cell
+  // overlaps. Show only every STEP_X/STEP_Y-th packet (>= one packet apart) so the
+  // real-size boxes don't intersect -- a realistic packed-bin layout, each box still
+  // coloured by its own computed pickability. Off => the full sampled field (overlaps).
+  const packed = !POINT_MODE && document.getElementById('t-packed').checked;
   targetMeshes.forEach((m, i) => {
-    m.visible = show[m.userData.cls] && (layer < 0 || depthOf(i) === layer);
+    const inSub = !packed || (m.userData.ix % STEP_X === 0 && m.userData.iy % STEP_Y === 0);
+    m.visible = inSub && show[m.userData.cls] && (layer < 0 || depthOf(i) === layer);
   });
   if (gripper) gripper.visible = document.getElementById('t-grip').checked;
   if (robot) robot.visible = document.getElementById('t-arm').checked;
@@ -246,8 +267,8 @@ function selectPose(i) {
   const b = curPose.base;
   const npick = curPose.pickable !== undefined ? curPose.pickable : curPose.covered;
   document.getElementById('readout').innerHTML =
-    `<span class="big">${curPose.coverage_pct}%</span> pickable ` +
-    `(${npick}/${curPose.total} packets)<br>` +
+    `<span class="big">${curPose.coverage_pct}%</span> ${POINT_MODE ? 'covered' : 'pickable'} ` +
+    `(${npick}/${curPose.total} ${POINT_MODE ? 'points' : 'packets'})<br>` +
     `<b>${curPose.placements}</b> centered placements<br>` +
     `base &nbsp;x=<b>${b.x}</b> y=<b>${b.y}</b> z=<b>${b.z}</b> m<br>` +
     `yaw=<b>${b.yaw_deg}&deg;</b>`;
@@ -269,8 +290,7 @@ function gotoPlacement(step) {
   const idx = placementIdx[playStep];
   const pick = curPose.picks[idx];
   setJoints(pick.joints_rad, pick.tool_yaw_deg);
-  const [cx, cy, cz] = pick.target_m;            // match the packet box center (top at z)
-  cursor.position.set(cx, cy, cz - PKT.height_m / 2);
+  setTargetPos(cursor, ...pick.target_m);        // match the target mesh (sphere or box)
   cursor.visible = true;
   document.getElementById('pick-info').innerHTML =
     `pick <b>${playStep + 1}</b>/${placementIdx.length} &nbsp; ` +
@@ -321,7 +341,7 @@ function wireUI(bundle) {
   });
   sel.addEventListener('change', () => selectPose(parseInt(sel.value, 10)));
 
-  ['t-place', 't-cover', 't-miss', 't-arm', 't-grip', 't-bin']
+  ['t-place', 't-cover', 't-miss', 't-packed', 't-arm', 't-grip', 't-bin']
     .forEach((id) => document.getElementById(id).addEventListener('change', applyFilters));
 
   const depth = document.getElementById('depth');
@@ -351,9 +371,28 @@ async function main() {
   if (!bundle) return;
   CFG = bundle.config;
   GRID = CFG.target_grid;
+  POINT_MODE = !CFG.packet;                       // no packet block => original point sim
   PKT = CFG.packet || { length_m: 0.2413, width_m: 0.3302, height_m: 0.0318 };
+  // Packed-view stride: how many grid cells span one packet (so drawn boxes don't
+  // overlap). Derived from the actual grid pitch in the run's first pose.
+  if (!POINT_MODE) {
+    const pk = bundle.top_bests[0].picks;
+    const dx = Math.abs(pk[1].target_m[0] - pk[0].target_m[0]) || PKT.length_m;
+    const dy = Math.abs(pk[GRID.nx].target_m[1] - pk[0].target_m[1]) || PKT.width_m;
+    STEP_X = Math.max(1, Math.ceil(PKT.length_m / dx - 1e-9));
+    STEP_Y = Math.max(1, Math.ceil(PKT.width_m / dy - 1e-9));
+  } else {
+    document.getElementById('row-packed').style.display = 'none';  // points don't overlap
+  }
+  // Adapt the legend wording to the sim that produced this run.
+  const L = POINT_MODE
+    ? { place: 'placement (foam centered)', cover: 'covered off-center', miss: 'not covered' }
+    : { place: 'placement packets (plate centered)', cover: 'pickable off-center', miss: 'not pickable' };
+  document.getElementById('lbl-place').textContent = L.place;
+  document.getElementById('lbl-cover').textContent = L.cover;
+  document.getElementById('lbl-miss').textContent = L.miss;
   document.getElementById('run-label').textContent =
-    `${runArg.split('/').slice(-2, -1)[0] || 'run'} · ` +
+    `${runArg.split('/').slice(-2, -1)[0] || 'run'} · ${POINT_MODE ? 'points' : 'packets'} · ` +
     `${bundle.summary.total_base_poses} poses × ${bundle.summary.total_targets} targets`;
 
   buildBin();

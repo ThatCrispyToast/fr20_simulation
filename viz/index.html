@@ -72,11 +72,12 @@
   <fieldset>
     <legend>Show / hide</legend>
     <label><input type="checkbox" id="t-place" checked>
-      <span class="chk swatch-green"></span>placement packets (plate centered)</label>
+      <span class="chk swatch-green"></span><span id="lbl-place">placement (plate centered)</span></label>
     <label><input type="checkbox" id="t-cover" checked>
-      <span class="chk swatch-amber"></span>pickable off-center</label>
+      <span class="chk swatch-amber"></span><span id="lbl-cover">pickable off-center</span></label>
     <label><input type="checkbox" id="t-miss" checked>
-      <span class="chk swatch-red"></span>not pickable</label>
+      <span class="chk swatch-red"></span><span id="lbl-miss">not pickable</span></label>
+    <label id="row-packed"><input type="checkbox" id="t-packed" checked> packed view (no overlap)</label>
     <label style="margin-top:6px"><input type="checkbox" id="t-arm" checked> robot arm</label>
     <label><input type="checkbox" id="t-grip" checked> gripper plate</label>
     <label><input type="checkbox" id="t-bin" checked> bin walls</label>

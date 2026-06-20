@@ -36,6 +36,23 @@ uv sync
 uv run python src/bin_reach.py
 ```
 
+### Two models: packets vs. points
+
+There are two independent, self-contained sims:
+
+- **`src/bin_reach.py`** — the **packet** model: targets are real boxes (default
+  9.5 × 13 × 1.25 in) and a packet is *pickable* when ≥ `PACKET_CONTACT_FRAC` of it sits
+  under the foam (the main model described below).
+- **`src/bin_reach_points.py`** — the original **point** model: targets are abstract
+  points and a point is *covered* when it falls under the foam footprint of any reachable
+  placement. Run it the same way (`uv run python src/bin_reach_points.py`). Useful as a
+  simpler, geometry-only baseline.
+
+Both write the same `out/run_<timestamp>/` artifacts and `best_versions.json` schema, and
+the 3D viewer renders either one (it auto-detects the model — packets as boxes, points as
+spheres). The sections below describe the packet model; the point model is identical
+except for the pick test and that it draws points instead of packets.
+
 The default sweep is wide on all axes — `11 (x) × 11 (y) × 11 (z) × 4 (yaw) =
 5324` mount poses, each tested against `10 × 10 × 6 = 600` pick targets. The yaw
 axis rotates the base about the vertical: the arm's reachable envelope is not
