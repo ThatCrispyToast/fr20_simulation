@@ -151,7 +151,9 @@ BASE_YAW_RANGE = np.deg2rad(np.linspace(0.0, 90.0, 4))   # [0, 30, 60, 90] deg
 # packet count (N_X*N_Y*N_Z). 10x10x6 = 600 packets (~0.11 m spacing); was 6x6x4 = 144.
 # Runtime grows ~proportionally (so ~4x vs the old grid).
 N_X, N_Y, N_Z = 10, 10, 6        # grid resolution of pick targets (600 packet centers)
-MARGIN = 0.06                    # keep packet centers this far inside the walls/floor
+MARGIN = 0.06                    # z clearance only: packet tops stay this far below the
+                                 # opening / above the floor. In XY the grid insets by the
+                                 # packet half-extent so packets sit flush to the walls.
 
 # ----------------------------------------------------------------------------
 # Packets -- the actual parts being picked (replaces abstract point targets)
@@ -358,8 +360,13 @@ def joint_limits(rid, joints):
 # ----------------------------------------------------------------------------
 def bin_targets():
     cx, cy = BIN_CENTER_XY
-    xs = np.linspace(cx - BIN_L / 2 + MARGIN, cx + BIN_L / 2 - MARGIN, N_X)
-    ys = np.linspace(cy - BIN_W / 2 + MARGIN, cy + BIN_W / 2 - MARGIN, N_Y)
+    # Inset packet CENTERS by the packet half-extent so the whole packet stays inside
+    # the walls -- the outermost packets sit FLUSH against the inner wall faces (edge
+    # touching the wall), as real packets in a packed bin do. (A packet center can't be
+    # closer to a wall than half its size without the box poking through.) z is the
+    # packet-top contact plane, kept MARGIN below the opening / above the floor.
+    xs = np.linspace(cx - BIN_L / 2 + PACKET_L / 2, cx + BIN_L / 2 - PACKET_L / 2, N_X)
+    ys = np.linspace(cy - BIN_W / 2 + PACKET_W / 2, cy + BIN_W / 2 - PACKET_W / 2, N_Y)
     zs = np.linspace(MARGIN, BIN_DEPTH - MARGIN, N_Z)
     pts = [(x, y, z) for z in zs for y in ys for x in xs]
     return np.array(pts), xs, ys, zs

@@ -80,6 +80,12 @@ The reachability core:
   axis-aligned packet box (`PACKET_L/W/H`, default 9.5×13×1.25 in) whose **top face**
   is at the target z (the suction contact plane). The old abstract point target is
   gone; `target_m` is now a packet center.
+- **The XY grid insets by the packet half-extent** (not `MARGIN`) so whole packets stay
+  inside the bin — the outermost packets sit **flush** against the inner walls (edge on
+  the wall), as in a packed bin. `MARGIN` now only insets z (packet-top depth). Using
+  the old point `MARGIN` for XY made edge packets overhang the walls (a modeling bug):
+  with point targets a center 6 cm from the wall was fine, but a packet's half-extent
+  is 12–17 cm, so its box poked through. Keep the XY inset = packet half-extent.
 - **`solve_pick()` is the single source of truth for a *centered placement*.** It
   returns the actual joint config (or `None`) after all gates: suction-face center on
   the packet center, tool tilt, joint limits, and collisions (bin, self, gripper), plus
