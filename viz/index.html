@@ -70,6 +70,26 @@
   </fieldset>
 
   <fieldset>
+    <legend>Inspect — click a packet</legend>
+    <div id="sel-info" style="font-size:11.5px;color:var(--muted)">
+      Click any packet to drive the arm to it. Step through <b>every</b> joint config
+      that reaches its TCP — valid ones and the failed attempts (with the reason).
+    </div>
+    <div class="row" style="margin-top:8px">
+      <button id="sol-prev">‹ config</button>
+      <button id="sol-next">config ›</button>
+    </div>
+    <div id="sol-info" style="font-size:11.5px;color:var(--muted);margin-top:4px"></div>
+    <div class="row" style="margin-top:8px">
+      <button id="fail-prev">‹ prev failed</button>
+      <button id="fail-next">next failed ›</button>
+    </div>
+    <div class="row" style="margin-top:6px">
+      <button id="sel-clear">clear selection</button>
+    </div>
+  </fieldset>
+
+  <fieldset>
     <legend>Show / hide</legend>
     <label><input type="checkbox" id="t-place" checked>
       <span class="chk swatch-green"></span><span id="lbl-place">placement (plate centered)</span></label>
@@ -77,6 +97,8 @@
       <span class="chk swatch-amber"></span><span id="lbl-cover">pickable off-center</span></label>
     <label><input type="checkbox" id="t-miss" checked>
       <span class="chk swatch-red"></span><span id="lbl-miss">not pickable</span></label>
+    <label id="row-buried"><input type="checkbox" id="t-buried" checked>
+      <span class="chk" style="background:#6b7280"></span>buried (under the top layer)</label>
     <label id="row-packed"><input type="checkbox" id="t-packed" checked> packed view (no overlap)</label>
     <label style="margin-top:6px"><input type="checkbox" id="t-arm" checked> robot arm</label>
     <label><input type="checkbox" id="t-grip" checked> gripper plate</label>

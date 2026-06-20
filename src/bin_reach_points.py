@@ -203,6 +203,14 @@ ANIM_FPS       = 8          # frames per second in the saved GIF
 # false negatives, but proportionally slower.
 N_IK_SEEDS = 8           # random seed configs tried per pose (plus the mid-range one)
 
+# Per-point IK-solution dump (for the viewer's click-to-inspect / failure paths).
+# enumerate_solutions() re-solves each point of the REPORTED poses with this many seeds
+# and keeps every DISTINCT joint config (valid + failed, with the failure reason) so the
+# viewer can show "every way the arm can reach this TCP" and how a failed point fails.
+DUMP_SOLUTIONS    = True
+N_SOLUTION_SEEDS  = 24   # seeds used only by enumerate_solutions (dump phase only)
+MAX_SOLUTIONS     = 16   # cap on distinct configs stored per point
+
 # ----------------------------------------------------------------------------
 # Setup
 # ----------------------------------------------------------------------------
@@ -366,14 +374,16 @@ def down_orientations():
             oris.append(p.getQuaternionFromEuler([math.pi + roll, pitch, yz]))
     return oris
 
-def ik_seeds(lo, hi):
+def ik_seeds(lo, hi, n=None):
     """Initial joint guesses for the IK solver. The numerical solver converges
     to whichever solution is nearest its seed, so seeding from several postures
     is how we discover the multiple configs (elbow up/down, wrist flips) that
-    reach the same TCP. First seed is the mid-range pose for determinism."""
+    reach the same TCP. First seed is the mid-range pose for determinism. `n`
+    overrides N_IK_SEEDS (the dump uses N_SOLUTION_SEEDS to find more configs)."""
+    n = N_IK_SEEDS if n is None else n
     rng = np.random.default_rng(0)
     seeds = [[(l + h) / 2 for l, h in zip(lo, hi)]]
-    for _ in range(max(N_IK_SEEDS, 0)):
+    for _ in range(max(n, 0)):
         seeds.append([float(rng.uniform(l, h)) for l, h in zip(lo, hi)])
     return seeds
 
@@ -485,6 +495,68 @@ def reachable(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
     full logic so coverage, the data dump, and the animation never diverge)."""
     return solve_pick(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
                       orientations, seeds) is not None
+
+def enumerate_solutions(rid, bin_id, gripper_id, ee_link, joints, lo, hi, target,
+                        orientations, seeds):
+    """EVERY distinct way the joints can be configured to put the foam face on
+    `target` pointing down -- for the viewer's "click a point, see how the arm reaches
+    (or fails to reach) it" inspector. Unlike solve_pick (which bails on the first valid
+    config), this tries all clockings x all seeds, keeps each distinct joint config once
+    (rounded), and annotates WHY it fails (reach/unreachable/tilt/limits/collision_*).
+    Returns {joints, fk_err, tilt_deg, ok, fail, ori_idx, accepted} per config, ok ones
+    first, capped at MAX_SOLUTIONS."""
+    target = np.asarray(target, dtype=float)
+    standoff = GRIPPER_STANDOFF if USE_GRIPPER else 0.0
+    flange_goal = target + np.array([0.0, 0.0, standoff])
+    base_pos = np.array(p.getBasePositionAndOrientation(rid)[0])
+    reach_ok = np.linalg.norm(flange_goal - base_pos) <= REACH_MAX
+    max_tilt = TILT_CONE_DEG + ORI_TOL_DEG
+    sols, seen, accepted_found = [], set(), False
+    for ori_idx, ori in enumerate(orientations):
+        for seed in seeds:
+            for j, q in zip(joints, seed):
+                p.resetJointState(rid, j, q)
+            sol = p.calculateInverseKinematics(
+                rid, ee_link, flange_goal.tolist(), ori,
+                lowerLimits=lo, upperLimits=hi,
+                jointRanges=[h - l for l, h in zip(lo, hi)],
+                restPoses=seed, maxNumIterations=200, residualThreshold=1e-4)
+            for j, q in zip(joints, sol):
+                p.resetJointState(rid, j, q)
+            key = tuple(round(q, 2) for q in sol)
+            if key in seen:
+                continue
+            seen.add(key)
+            ls = p.getLinkState(rid, ee_link, computeForwardKinematics=True)
+            flange_pos, flange_orn = np.array(ls[4]), ls[5]
+            suction = flange_pos - np.array([0.0, 0.0, standoff])
+            fk_err = float(np.linalg.norm(suction - target))
+            tilt = _tool_tilt_deg(flange_orn)
+            fail = None
+            if not reach_ok:
+                fail = "reach"
+            elif fk_err > FK_TOL:
+                fail = "unreachable"
+            elif tilt > max_tilt:
+                fail = "tilt"
+            elif any(q < l - 1e-3 or q > h + 1e-3 for q, l, h in zip(sol, lo, hi)):
+                fail = "limits"
+            elif _penetrates(rid, bin_id):
+                fail = "collision_bin"
+            elif _penetrates(rid, rid, exclude_adjacent=True):
+                fail = "collision_self"
+            elif USE_GRIPPER and gripper_id is not None:
+                place_gripper(gripper_id, flange_pos, ori)
+                if _penetrates(gripper_id, bin_id):
+                    fail = "collision_gripper"
+            ok = fail is None
+            accepted = ok and not accepted_found
+            accepted_found = accepted_found or ok
+            sols.append({"joints": [float(q) for q in sol], "fk_err": fk_err,
+                         "tilt_deg": tilt, "ok": ok, "fail": fail,
+                         "ori_idx": ori_idx, "accepted": accepted})
+    sols.sort(key=lambda s: (not s["accepted"], not s["ok"], s["fk_err"]))
+    return sols[:MAX_SOLUTIONS]
 
 # ----------------------------------------------------------------------------
 # Main sweep
@@ -988,19 +1060,41 @@ def plot_target_frequency(target_freq, xs, ys, zs):
 # ----------------------------------------------------------------------------
 # Detailed data dump + reproducible end animation (run after every sweep)
 # ----------------------------------------------------------------------------
-def _pick_records(world, base, targets, covered):
-    """Per-target detail for one base pose. `covered` marks points the foam footprint
-    reaches (the reported metric). Each target is also re-solved with solve_pick (the
-    same deterministic logic as the sweep) to flag the points where the plate can be
-    CENTERED -- a real placement -- and log its joint solution / FK error / tool tilt."""
+def _sol_rec(s):
+    """JSON-friendly record for one enumerated IK solution (viewer click-inspect)."""
+    return {"joints_rad": [round(q, 5) for q in s["joints"]],
+            "fk_err_mm": round(s["fk_err"] * 1000, 2),
+            "tilt_deg": round(s["tilt_deg"], 2),
+            "ok": bool(s["ok"]), "fail": s["fail"],
+            "tool_yaw_deg": (round(float(TOOL_YAW_DEG[s["ori_idx"]]), 1)
+                             if USE_GRIPPER else 0.0),
+            "accepted": bool(s["accepted"])}
+
+def _pick_records(world, base, targets, covered, sol_seeds=None):
+    """Per-point detail for one base pose. `covered` marks points the foam footprint
+    reaches (the reported metric). Each point is flagged where the plate can be CENTERED
+    -- a real placement -- with its joint solution / FK error / tool tilt. When
+    `sol_seeds` is given (DUMP_SOLUTIONS), every distinct IK config for the TCP is
+    enumerated into `solutions` (valid + failed, with the reason) for the viewer's
+    click-to-inspect / failure paths; the accepted one supplies the top-level fields."""
     set_base(world["rid"], base["xy"], base["z"], base["yaw"])
     recs = []
     for t, cov in zip(targets, covered):
-        sol = solve_pick(world["rid"], world["bin_id"], world["gripper_id"],
-                         world["ee"], world["joints"], world["lo"], world["hi"],
-                         t, world["orientations"], world["seeds"])
-        rec = {"target_m": [round(float(v), 4) for v in t],
-               "covered": bool(cov), "is_placement": sol is not None}
+        rec = {"target_m": [round(float(v), 4) for v in t], "covered": bool(cov)}
+        if sol_seeds is not None:
+            sols = enumerate_solutions(world["rid"], world["bin_id"],
+                                       world["gripper_id"], world["ee"], world["joints"],
+                                       world["lo"], world["hi"], t,
+                                       world["orientations"], sol_seeds)
+            acc = next((s for s in sols if s["accepted"]), None)
+            rec["is_placement"] = acc is not None
+            rec["solutions"] = [_sol_rec(s) for s in sols]
+            sol = acc
+        else:
+            sol = solve_pick(world["rid"], world["bin_id"], world["gripper_id"],
+                             world["ee"], world["joints"], world["lo"], world["hi"],
+                             t, world["orientations"], world["seeds"])
+            rec["is_placement"] = sol is not None
         if sol is not None:
             rec["joints_rad"] = [round(q, 5) for q in sol["joints"]]
             rec["joints_deg"] = [round(math.degrees(q), 2) for q in sol["joints"]]
@@ -1013,11 +1107,11 @@ def _pick_records(world, base, targets, covered):
         recs.append(rec)
     return recs
 
-def _best_block(world, b, rank, targets, zs):
+def _best_block(world, b, rank, targets, zs, sol_seeds=None):
     """One base pose's full record (summary + per-depth COVERED counts + every pick's
     covered/placement flags and joint solution) plus its (n_targets x n_joints) joint
     array for the NPZ (filled at the centered placements)."""
-    recs = _pick_records(world, b, targets, b["mask"])
+    recs = _pick_records(world, b, targets, b["mask"], sol_seeds)
     mask3 = b["mask"].reshape(N_Z, N_Y, N_X)
     per_depth = [{"z_m": round(float(zs[k]), 3),
                   "covered": int(mask3[k].sum()),
@@ -1079,19 +1173,21 @@ def dump_best_data(world, bests, diverse, targets, coverage, target_freq):
         "n_ik_seeds": N_IK_SEEDS, "n_workers": N_WORKERS,
         "diverse_min_dist": DIVERSE_MIN_DIST,
     }
+    sol_seeds = (ik_seeds(world["lo"], world["hi"], N_SOLUTION_SEEDS)
+                 if DUMP_SOLUTIONS else None)
     npz = {"coverage": coverage,
            "target_freq": target_freq.reshape(N_Z, N_Y, N_X),
            "targets_m": targets}
     top_blocks = []
     for r, b in enumerate(bests, 1):
-        block, jc = _best_block(world, b, r, targets, zs)
+        block, jc = _best_block(world, b, r, targets, zs, sol_seeds)
         top_blocks.append(block)
         npz[f"best{r}_covered_mask"] = b["mask"]
         npz[f"best{r}_center_mask"] = b["center_mask"]
         npz[f"best{r}_joints_rad"] = jc
     diverse_blocks = []
     for r, b in enumerate(diverse, 1):
-        block, jc = _best_block(world, b, r, targets, zs)
+        block, jc = _best_block(world, b, r, targets, zs, sol_seeds)
         diverse_blocks.append(block)
         npz[f"diverse{r}_covered_mask"] = b["mask"]
         npz[f"diverse{r}_center_mask"] = b["center_mask"]

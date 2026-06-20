@@ -20,10 +20,16 @@ and no test suite — verification is done by running the script (see below).
   `CONFIG` block near the top; edit there, not in the functions.
 - `src/bin_reach_points.py` — a **separate, self-contained** copy that keeps the original
   **POINT** model (abstract point targets; "covered" = point under the foam footprint of
-  any reachable placement; no packets, no contact fraction). It duplicates `bin_reach.py`
-  rather than sharing code — keep edits intentional, the two are meant to diverge. Both
-  write the same `best_versions.json` schema (the point one omits the `config.packet`
-  block and uses a `covered` per-pick field instead of `pickable`).
+  any reachable placement; no packets, no contact fraction). Omits the `config.packet`
+  block; uses a `covered` per-pick field instead of `pickable`.
+- `src/bin_reach_packed.py` — a third self-contained copy: a **fully-packed pallet**. The
+  bin is tiled edge-to-edge in X/Y/Z from the packet size (`_packed_layout`, counts =
+  floor(bin/packet), so it OVERRIDES `N_X/N_Y/N_Z` at import). Only the TOP packet of each
+  column is scored (a `_pick_packet` fine off-center tool search); the rest are `buried`.
+  Coverage is over the accessible (top) packets only. JSON adds a `config.packed` block and
+  a `buried` flag per pick.
+- All three sims **duplicate** `bin_reach.py` rather than share code — keep edits
+  intentional, they are meant to diverge. They share only the read-only viewer.
 - `src/serve_viz.py` + `viz/` — the optional browser viewer (see "3D viewer" below). It
   only **consumes** `best_versions.json` from EITHER sim; it auto-detects the model from
   the JSON (`config.packet` present → packets as boxes, absent → points as spheres). It
@@ -99,6 +105,13 @@ The reachability core:
   the packet center, tool tilt, joint limits, and collisions (bin, self, gripper), plus
   `ori_idx` = which clocking won. `reachable()` is just `solve_pick(...) is not None`.
   (The packet itself is **not** a collision body — the foam is meant to land on it.)
+- **`enumerate_solutions()` is the dump-only sibling for the viewer's click-inspect.**
+  It tries all clockings × all seeds (`N_SOLUTION_SEEDS`, more than the sweep), keeps each
+  DISTINCT joint config once, and annotates `ok`/`fail` (`reach`/`unreachable`/`tilt`/
+  `limits`/`collision_bin`/`collision_self`/`collision_gripper`), `accepted` marking the
+  one `solve_pick` would pick. Written per pick as `solutions` (gated by `DUMP_SOLUTIONS`)
+  so a failed packet shows *how* it fails. It does NOT feed coverage — sweep results are
+  unchanged whether or not solutions are dumped.
 - **Pickable ≠ centered placement.** A packet is *pickable* (the reported metric, still
   stored in the `mask`/`covered` variables) if some collision-free placement — not only
   the one centered on it — covers at least `PACKET_CONTACT_FRAC` of the **packet's top**
@@ -180,20 +193,36 @@ URDF/meshes — `file://` can't), and opens `viz/index.html?run=<rel-json>`.
   clocked by `tool_yaw_deg`. The arm is the real FR20 via `urdf-loader` (joints `j1..j6`,
   flange = `wrist3_link`); playback drives `joints_rad` from the JSON `picks`, and the
   gripper follows the FK flange. Targets are coloured by `is_placement` / pickable.
-- **Dual model:** `POINT_MODE = !CFG.packet`. Packet runs (`config.packet` present) draw
-  each target as a **box** sized from `CFG.packet`, top face at the target z, flagged by
-  `pickable`; point runs (no `config.packet`) draw a small **sphere** at the target,
-  flagged by `covered`. `classOf` reads whichever of `pickable`/`covered` exists, and the
-  legend/readout wording switches on `POINT_MODE`. `setTargetPos` handles the z offset
-  (box center = z − h/2; point sits at z).
-- **Packed view** (`t-packed`, packet mode only): the grid is sampled ~2.5–3.3× finer than
-  a packet, so drawing every cell's box overlaps. `STEP_X/STEP_Y = ceil(packet / pitch)`
-  (pitch read from the run's first pose) and `applyFilters` shows only every STEP-th cell
-  so the real-size boxes sit ≥ one packet apart — a realistic non-overlapping packed-bin
-  layout, each box still coloured by its own computed pickability. This is **display only**;
-  the sim's fine grid (the correct, finest pick test) is unchanged — coarsening the *sim*
-  to packet pitch would undercount near-wall off-center picks. Toggle off for the full
-  sampled field (boxes overlap).
+- **Three models, one viewer:** `POINT_MODE = !CFG.packet`. Packet/packed runs draw each
+  target as a **box** (top face at z); point runs draw a **sphere** at the point. `classOf`
+  → `buried` (packed, gray) / `place` (green) / `cover` (amber) / `miss` (red), reading
+  whichever of `pickable`/`covered` exists; the legend/readout wording switches on
+  `POINT_MODE`; the `buried` toggle row auto-hides when no pick is buried. `setTargetPos`
+  handles the z offset (box center = z − h/2; point sits at z).
+- **Click-to-inspect (`selectPacket`):** a pointer-up that didn't drag raycasts the visible
+  target meshes → selects a packet (cyan `selMarker`). It reads that pick's `solutions`
+  (the dumped list of EVERY distinct IK config for the TCP; falls back to the single
+  accepted config for older JSON) and `showSolution` drives the arm to each — the stepper
+  (`stepSolution`) cycles all configs, labelling each VALID or `✗ <reason>` via `FAIL_TEXT`.
+  `stepFailed` walks the selection through NOT-pickable, non-buried packets ("path the
+  failures"). Selecting pauses playback; playback hides the selection.
+- **Packet size is data-driven, never hard-coded.** Box dims come from `pickDims(pick)` =
+  the pick's own `size_m` (mixed-size runs) or else `CFG.packet`; geometries are cached per
+  distinct size; the highlight cursor is a unit box scaled per pick. Change the packet size
+  (or emit per-pick sizes) and re-run — the viewer adapts (geometry, z offset, cursor, and
+  the packed-view stride all follow the run's dims). The `PKT` fallback only fires for a
+  malformed JSON.
+- **Packed view** (`t-packed`, packet mode only): the grid is sampled finer than a packet,
+  so drawing every cell's box overlaps. `STEP_X/STEP_Y = ceil(maxPacket / pitch)` (pitch
+  read from the run's first pose, `maxPacket` = the largest packet so mixed sizes still
+  don't clip) and `applyFilters` shows only every STEP-th cell, so the real-size boxes sit
+  ≥ one packet apart — a non-overlapping packed-bin layout, each box still coloured by its
+  own computed pickability. **Display only**; the sim's fine grid (the correct, finest pick
+  test) is unchanged — coarsening the *sim* to packet pitch would undercount near-wall
+  off-center picks. Toggle off for the full sampled field (boxes overlap by design).
+- **`serve_viz` sends no-cache headers** (`_NoCacheHandler`) so an edited `app.js`/JSON
+  always reloads. Without this the browser silently runs a **stale** `app.js` — the usual
+  reason a viewer fix "doesn't take" (hard-refresh once after upgrading from a cached load).
 - Faithful plate clocking needs the `tool_yaw_deg` field both sims write per placement;
   the viewer falls back to 0 for older JSON without it.
 - The viewer is **not** part of `run()` and writes nothing — keep the study self-contained.
@@ -206,7 +235,12 @@ with the target count (`N_X·N_Y·N_Z`, raised from 144 to 600), the clocking co
 is a separate IK attempt; `USE_GRIPPER = False` collapses to one), and `N_IK_SEEDS`. The
 dump re-solves every target for each of the `N_BEST` + `N_DIVERSE` poses, and the
 animation renders one frame per reachable pick — together ~15–40 s; trim via
-`SAVE_ANIMATION` / `N_BEST` / `N_DIVERSE` if needed.
+`SAVE_ANIMATION` / `N_BEST` / `N_DIVERSE` if needed. `DUMP_SOLUTIONS` enumerates EVERY
+distinct IK config per packet for the reported poses (`N_SOLUTION_SEEDS` ≫ `N_IK_SEEDS`,
+no early-out) — the biggest single dump cost (minutes for many poses) and it grows the
+JSON to tens of MB; set `DUMP_SOLUTIONS = False` to skip. `bin_reach_packed.py` is
+*cheaper* per pose (only the ~`n_x·n_y` top-layer packets are scored, buried ones skipped),
+but its fine off-center search (`FINE_STEP`) multiplies IK per accessible packet.
 
 ## Conventions
 

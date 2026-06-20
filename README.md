@@ -36,22 +36,26 @@ uv sync
 uv run python src/bin_reach.py
 ```
 
-### Two models: packets vs. points
+### Three models
 
-There are two independent, self-contained sims:
+There are three independent, self-contained sims:
 
-- **`src/bin_reach.py`** — the **packet** model: targets are real boxes (default
-  9.5 × 13 × 1.25 in) and a packet is *pickable* when ≥ `PACKET_CONTACT_FRAC` of it sits
-  under the foam (the main model described below).
+- **`src/bin_reach.py`** — the **packet** model: targets are a fine grid of real boxes
+  (default 9.5 × 13 × 1.25 in) and a packet is *pickable* when ≥ `PACKET_CONTACT_FRAC` of
+  it sits under the foam (the main model described below).
 - **`src/bin_reach_points.py`** — the original **point** model: targets are abstract
-  points and a point is *covered* when it falls under the foam footprint of any reachable
-  placement. Run it the same way (`uv run python src/bin_reach_points.py`). Useful as a
-  simpler, geometry-only baseline.
+  points, *covered* when under the foam footprint of any reachable placement. A simpler
+  geometry-only baseline.
+- **`src/bin_reach_packed.py`** — a **fully-packed pallet**: the bin is filled edge-to-edge
+  with packets in X, Y and Z (counts derived from the packet size). Only the **top** packet
+  of each column is scored (the rest are flagged `buried`); each top packet uses a fine
+  off-center tool search so wall-flush packets can be picked by sitting the plate inward.
 
-Both write the same `out/run_<timestamp>/` artifacts and `best_versions.json` schema, and
-the 3D viewer renders either one (it auto-detects the model — packets as boxes, points as
-spheres). The sections below describe the packet model; the point model is identical
-except for the pick test and that it draws points instead of packets.
+Run any of them the same way (`uv run python src/bin_reach_packed.py`). All three write the
+same `out/run_<timestamp>/` artifacts and `best_versions.json` schema, and the 3D viewer
+renders any of them (it auto-detects the model — packets/buried as boxes, points as
+spheres). The sections below describe the packet model; the others differ only in the
+target layout and pick test.
 
 The default sweep is wide on all axes — `11 (x) × 11 (y) × 11 (z) × 4 (yaw) =
 5324` mount poses, each tested against `10 × 10 × 6 = 600` pick targets. The yaw
@@ -127,7 +131,7 @@ every run writes a timestamped folder `out/run_<timestamp>/` containing:
 - `coverage_vs_height.png` — best-base and mean coverage as a function of mount height
 - `target_reachability.png` — for every packet position, the % of all swept base positions that can pick it (highlights intrinsically hard bin regions), sliced by depth
 - `best_pick_cycle.gif` — **reproducible** end animation of the best base driving the arm through its real plate **placements**, packets drawn as boxes (markers: green = pickable, red = not), rendered offline so it's produced after every run (no GUI) and is byte-identical each time
-- `best_versions.json` — config snapshot (incl. the `packet` block) plus, for each pose in **`top_bests`** and **`diverse_bests`**: coverage, per-depth counts, and **every packet's** `pickable`/`is_placement` flags with the joint solution (rad + deg), FK error, tool tilt, and the winning footprint clocking (`tool_yaw_deg`) at each placement
+- `best_versions.json` — config snapshot (incl. the `packet` block) plus, for each pose in **`top_bests`** and **`diverse_bests`**: coverage, per-depth counts, and **every packet's** `pickable`/`is_placement` flags with the joint solution (rad + deg), FK error, tool tilt, and the winning footprint clocking (`tool_yaw_deg`) at each placement. With `DUMP_SOLUTIONS` (default on) each packet also carries `solutions` — **every distinct IK joint config** that reaches its TCP, valid and failed (each with `ok`/`fail` reason) — which powers the viewer's click-to-inspect
 - `best_versions.npz` — raw arrays: coverage grid, target frequency, packet-center coords, and per top/diverse pose the pickable mask, the centered-placement mask, and joint configs (NaN where not a placement)
 
 ## Interactive 3D viewer (three.js)
@@ -135,10 +139,17 @@ every run writes a timestamped folder `out/run_<timestamp>/` containing:
 A browser viewer renders a run's `best_versions.json` in 3D: the bin, the
 **articulated FR20** (loaded from the URDF + STL meshes), the vacuum-gripper plate,
 and the **packets** drawn as boxes coloured by outcome (green = a centered
-**placement**, amber = pickable off-centre, red = not pickable). Pick any reported
-base pose (top-N or diverse), slice the packet grid by depth, toggle layers, and
-**play the arm through its real placements** — driven by the joint solutions in the
-JSON, so the poses match the study exactly.
+**placement**, amber = pickable off-centre, red = not pickable, gray = buried in the
+packed sim). Pick any reported base pose (top-N or diverse), slice the packet grid by
+depth, toggle layers, and **play the arm through its real placements** — driven by the
+joint solutions in the JSON, so the poses match the study exactly.
+
+**Click any packet to inspect it.** The arm jumps to that packet and you can step
+through **every** joint configuration that reaches its TCP — the valid placements and
+the failed attempts, each labelled with why it fails (out of reach, IK can't reach,
+tool not level, joint limit, arm/plate hits the bin or itself). Use **prev/next failed**
+to walk through the un-pickable packets and see exactly how each one fails. (Needs a run
+dumped with `DUMP_SOLUTIONS`, the default.)
 
 ```bash
 uv run python src/serve_viz.py                 # newest out/run_* folder

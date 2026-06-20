@@ -22,6 +22,17 @@ import threading
 import webbrowser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 
+
+class _NoCacheHandler(SimpleHTTPRequestHandler):
+    """Static handler that tells the browser never to cache. Without this the browser
+    keeps running a stale `viz/app.js` after edits (the classic 'I fixed it but the
+    page still shows the old behaviour'), and serves an out-of-date run JSON."""
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        super().end_headers()
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(_HERE)              # served root (holds viz/, out/, resources/)
 OUT_DIR = os.path.join(REPO_ROOT, "out")
@@ -66,7 +77,7 @@ def main():
     rel_json = resolve_run(args.run)
 
     # Bind the static server to the repo root so /viz, /out and /resources resolve.
-    handler = functools.partial(SimpleHTTPRequestHandler, directory=REPO_ROOT)
+    handler = functools.partial(_NoCacheHandler, directory=REPO_ROOT)
     try:
         httpd = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
     except OSError as e:
