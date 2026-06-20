@@ -99,6 +99,9 @@ SIM_DWELL = 0.05         # seconds the GUI lingers on each pose so motion is vis
 SHOW_BEST_AFTER = True
 OUT_DIR   = os.path.join(_HERE, "..", "out")  # base output dir; each run writes
 RUN_DIR   = OUT_DIR                            # to a timestamped subfolder (set in run())
+# Which sim wrote a run -- tags the output folder (run_<SIM_TAG>_<timestamp>). "packed" =
+# this fully-packed pallet; siblings: "packet" (bin_reach.py), "point" (bin_reach_points.py).
+SIM_TAG   = "packed"
 
 # Bin geometry (meters). Interior floor sits at z=0, opening at z=BIN_DEPTH.
 # Pallet from resources/bin_info.md: 1092.2 x 1219.2 x 838.2 mm.
@@ -913,7 +916,7 @@ def _sweep_gui(targets, poses, meta, total):
 def run():
     # Each run writes its diagrams to out/run_<timestamp>/ so results don't clobber.
     global RUN_DIR, _W
-    RUN_DIR = os.path.join(OUT_DIR, time.strftime("run_%Y%m%d_%H%M%S"))
+    RUN_DIR = os.path.join(OUT_DIR, time.strftime(f"run_{SIM_TAG}_%Y%m%d_%H%M%S"))
     targets, xs, ys, zs = bin_targets()
     poses, meta = _pose_list()
     total = len(poses)

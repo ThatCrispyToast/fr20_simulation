@@ -52,7 +52,8 @@ There are three independent, self-contained sims:
   off-center tool search so wall-flush packets can be picked by sitting the plate inward.
 
 Run any of them the same way (`uv run python src/bin_reach_packed.py`). All three write the
-same `out/run_<timestamp>/` artifacts and `best_versions.json` schema, and the 3D viewer
+same artifacts and `best_versions.json` schema in a `out/run_<model>_<timestamp>/` folder
+tagged by the sim that wrote it (`packet` / `point` / `packed`), and the 3D viewer
 renders any of them (it auto-detects the model — packets/buried as boxes, points as
 spheres). The sections below describe the packet model; the others differ only in the
 target layout and pick test.
@@ -123,7 +124,7 @@ little) with more seeds.
 ### Outputs
 
 `run()` returns the **top-N base poses** as an array (`N_BEST`, best first), and
-every run writes a timestamped folder `out/run_<timestamp>/` containing:
+every run writes a timestamped, model-tagged folder `out/run_<model>_<timestamp>/` containing:
 
 - `coverage_vs_base.png` — coverage % (pickable packets) across the base XY grid, one panel per mount height, with per-cell values, the bin footprint, and the best base starred
 - `best_pos_slices.png` — pickable packets at the best base, sliced by depth, with the bin outline and per-slice counts

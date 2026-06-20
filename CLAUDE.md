@@ -38,13 +38,14 @@ and no test suite — verification is done by running the script (see below).
   meshes (extracted from `fairino20_v6_description.zip`). The URDF's `package://` paths
   resolve relative to `resources/` via `p.setAdditionalSearchPath` in `connect()`.
 - `resources/bin_info.md` — the pallet dimensions the bin geometry is derived from.
-- `out/run_<timestamp>/` — per-run outputs (git-ignored). Never overwritten.
+- `out/run_<model>_<timestamp>/` — per-run outputs (git-ignored), tagged by the sim that
+  wrote them via each script's `SIM_TAG` (`packet` / `point` / `packed`). Never overwritten.
 
 ## Run / verify
 
 ```bash
 uv sync                              # install deps (pybullet, numpy, matplotlib, pillow)
-uv run python src/bin_reach.py       # full run; writes out/run_<timestamp>/
+uv run python src/bin_reach.py       # full run; writes out/run_packet_<timestamp>/
 ```
 
 Syntax check without running:
