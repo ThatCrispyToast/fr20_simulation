@@ -167,11 +167,11 @@ MARGIN = 0.06                    # z clearance only: packet tops stay this far b
 # Real packets vary in size, so the dimensions are parameters; for now a single nominal
 # size is used for every packet. (To make them genuinely variable later, draw a size
 # per packet and recompute the per-packet pickup offsets -- the contact test below is
-# already size-driven.) Nominal packet: 9.5 in x 13 in x 1.25 in.
+# already size-driven.) Nominal packet: 4.75 in x 9.75 in x 0.625 in.
 _IN = 0.0254                     # inches -> meters
-PACKET_L = 9.5  * _IN            # 0.2413 m, packet extent along world x
-PACKET_W = 13.0 * _IN            # 0.3302 m, packet extent along world y
-PACKET_H = 1.25 * _IN            # 0.0318 m, packet thickness (top face = pick plane)
+PACKET_L = 4.75  * _IN           # 0.1207 m, packet extent along world x
+PACKET_W = 9.75 * _IN            # 0.2477 m, packet extent along world y
+PACKET_H = 0.625 * _IN           # 0.0159 m, packet thickness (top face = pick plane)
 # A packet is pickable when the gripper can be placed (reachable, level, collision-free)
 # so that at least this fraction of the PACKET's top face is covered by (in contact
 # with) the TOOL BOTTOM -- the foam face, GRIPPER_LENGTH x GRIPPER_WIDTH -- i.e. enough
