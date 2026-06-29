@@ -47,9 +47,10 @@ There are three independent, self-contained sims:
   points, *covered* when under the foam footprint of any reachable placement. A simpler
   geometry-only baseline.
 - **`src/bin_reach_packed.py`** — a **fully-packed pallet**: the bin is filled edge-to-edge
-  with packets in X, Y and Z (counts derived from the packet size). Only the **top** packet
-  of each column is scored (the rest are flagged `buried`); each top packet uses a fine
-  off-center tool search so wall-flush packets can be picked by sitting the plate inward.
+  with packets in X, Y and Z (counts derived from the packet size). **Every** packet is
+  scored, each evaluated as the exposed surface at its own depth (as it would be reached
+  during top-down unpacking); each uses a fine off-center tool search so wall-flush packets
+  can be picked by sitting the plate inward. Coverage is the fraction of the whole pack.
 
 Run any of them the same way (`uv run python src/bin_reach_packed.py`). All three write the
 same artifacts and `best_versions.json` schema in a `out/run_<model>_<timestamp>/` folder
@@ -140,8 +141,8 @@ every run writes a timestamped, model-tagged folder `out/run_<model>_<timestamp>
 A browser viewer renders a run's `best_versions.json` in 3D: the bin, the
 **articulated FR20** (loaded from the URDF + STL meshes), the vacuum-gripper plate,
 and the **packets** drawn as boxes coloured by outcome (green = a centered
-**placement**, amber = pickable off-centre, red = not pickable, gray = buried in the
-packed sim). Pick any reported base pose (top-N or diverse), slice the packet grid by
+**placement**, amber = pickable off-centre, red = not pickable). In the fully-packed
+sim, slice by depth to see inside the pack. Pick any reported base pose (top-N or diverse), slice the packet grid by
 depth, toggle layers, and **play the arm through its real placements** — driven by the
 joint solutions in the JSON, so the poses match the study exactly.
 

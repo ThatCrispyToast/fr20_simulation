@@ -24,10 +24,10 @@ and no test suite — verification is done by running the script (see below).
   block; uses a `covered` per-pick field instead of `pickable`.
 - `src/bin_reach_packed.py` — a third self-contained copy: a **fully-packed pallet**. The
   bin is tiled edge-to-edge in X/Y/Z from the packet size (`_packed_layout`, counts =
-  floor(bin/packet), so it OVERRIDES `N_X/N_Y/N_Z` at import). Only the TOP packet of each
-  column is scored (a `_pick_packet` fine off-center tool search); the rest are `buried`.
-  Coverage is over the accessible (top) packets only. JSON adds a `config.packed` block and
-  a `buried` flag per pick.
+  floor(bin/packet), so it OVERRIDES `N_X/N_Y/N_Z` at import). **Every** packet is scored
+  via a `_pick_packet` fine off-center tool search, each evaluated as the exposed surface at
+  its depth (top-down unpacking; same single-packet isolation as the others — no inter-packet
+  collisions). Coverage is over the whole pack. JSON adds a `config.packed` block.
 - All three sims **duplicate** `bin_reach.py` rather than share code — keep edits
   intentional, they are meant to diverge. They share only the read-only viewer.
 - `src/serve_viz.py` + `viz/` — the optional browser viewer (see "3D viewer" below). It
@@ -196,10 +196,12 @@ URDF/meshes — `file://` can't), and opens `viz/index.html?run=<rel-json>`.
   gripper follows the FK flange. Targets are coloured by `is_placement` / pickable.
 - **Three models, one viewer:** `POINT_MODE = !CFG.packet`. Packet/packed runs draw each
   target as a **box** (top face at z); point runs draw a **sphere** at the point. `classOf`
-  → `buried` (packed, gray) / `place` (green) / `cover` (amber) / `miss` (red), reading
-  whichever of `pickable`/`covered` exists; the legend/readout wording switches on
-  `POINT_MODE`; the `buried` toggle row auto-hides when no pick is buried. `setTargetPos`
-  handles the z offset (box center = z − h/2; point sits at z).
+  → `place` (green) / `cover` (amber) / `miss` (red), reading whichever of
+  `pickable`/`covered` exists; the legend/readout wording switches on `POINT_MODE`.
+  `setTargetPos` handles the z offset (box center = z − h/2; point sits at z). (A `buried`
+  gray class + toggle is still handled for backward-compat with old packed runs, but the
+  current packed sim scores every packet and no longer emits `buried`; the toggle row
+  auto-hides when no pick has it.)
 - **Click-to-inspect (`selectPacket`):** a pointer-up that didn't drag raycasts the visible
   target meshes → selects a packet (cyan `selMarker`). It reads that pick's `solutions`
   (the dumped list of EVERY distinct IK config for the TCP; falls back to the single
