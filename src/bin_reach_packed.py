@@ -2,18 +2,17 @@
 Overhead-arm bin reachability feasibility study (PyBullet) -- FULLY-PACKED PALLET.
 
 This variant fills the WHOLE bin with packets, tiled edge-to-edge in X, Y and Z and
-sized purely from the packet dimensions (n = floor(bin / packet) per axis) -- a complete
-pallet, every layer included. EVERY packet is scored, each evaluated as the surface at
-its own depth -- i.e. as it would be exposed during top-down unpacking, with the packets
-above it already removed (inter-packet collisions aren't simulated; same single-packet
-isolation as the other sims). Each packet is tested with a fine off-center tool search so
-one flush against a wall can still be picked by sitting the plate inward (the plate is
-bigger than a packet). Coverage is the fraction of the WHOLE packed bin the arm can pick
-over the course of unpacking it.
+sized purely from the packet dimensions (n = floor(bin / packet) per axis) -- a
+visually complete pallet. Only the TOP packet of each column is accessible; the ones
+under it are flagged `buried` (a packet with others stacked on top can't be reached, and
+inter-packet collisions aren't simulated, so deeper packets are not scored). Each
+accessible (top-layer) packet is tested with a fine off-center tool search so a packet
+flush against a wall can still be picked by sitting the plate inward (the plate is bigger
+than a packet); coverage is reported over the accessible packets.
 
 The fine-sampling-grid variants live in `bin_reach.py` (packets) and
 `bin_reach_points.py` (points). All three share the read-only 3D viewer
-(`serve_viz.py` + `viz/`).
+(`serve_viz.py` + `viz/`); this run's JSON carries a `buried` flag per packet.
 
 What it does
 ------------
@@ -169,7 +168,7 @@ BASE_YAW_RANGE = np.deg2rad(np.linspace(0.0, 90.0, 4))   # [0, 30, 60, 90] deg
 # unused for tiling (kept for the dump's z helper).
 N_X = N_Y = N_Z = 1              # placeholder; overwritten from the packet size below
 MARGIN = 0.06
-# Off-center tool search step (m): a packet is pickable if a level,
+# Off-center tool search step (m): an accessible packet is pickable if a level,
 # collision-free placement at ANY tool-center offset on this grid keeps >= the contact
 # fraction of the packet under the foam. Finer = fewer false negatives, slower.
 FINE_STEP = 0.03
@@ -200,8 +199,9 @@ PACKET_CONTACT_FRAC = 0.60       # min overlap(tool bottom, packet top) / packet
 def _packed_layout():
     """Fill the bin with packets, tiled edge-to-edge in X, Y, Z (n = floor(bin/packet)
     per axis), centred in XY and stacked from the floor. Returns the packet centers
-    (z = each layer's TOP face, the pick plane), the per-axis ticks and the counts.
-    z-major order (bottom layer first), like the other sims. EVERY packet is scored."""
+    (z = each layer's TOP face, the pick plane), the per-axis ticks, the counts, a
+    `buried` flag per packet (everything below the top of its column), and the indices
+    of the accessible (top-of-column) packets. z-major order, like the other sims."""
     cx, cy = BIN_CENTER_XY
     nx = max(1, int((BIN_L + 1e-9) // PACKET_L))
     ny = max(1, int((BIN_W + 1e-9) // PACKET_W))
@@ -210,9 +210,14 @@ def _packed_layout():
     ys = cy - ny * PACKET_W / 2 + PACKET_W / 2 + np.arange(ny) * PACKET_W
     zs = (np.arange(nz) + 1) * PACKET_H              # top face of each stacked layer
     pts = np.array([(x, y, z) for z in zs for y in ys for x in xs])
-    return pts, xs, ys, zs, nx, ny, nz
+    buried = np.ones(len(pts), dtype=bool)           # top-of-column accessible, rest buried
+    top_idx = (nz - 1) * nx * ny + np.arange(nx * ny)
+    buried[top_idx] = False
+    return pts, xs, ys, zs, nx, ny, nz, buried, top_idx
 
-(_PACKED_PTS, _PACKED_XS, _PACKED_YS, _PACKED_ZS, N_X, N_Y, N_Z) = _packed_layout()
+(_PACKED_PTS, _PACKED_XS, _PACKED_YS, _PACKED_ZS,
+ N_X, N_Y, N_Z, _BURIED, _TOP_IDX) = _packed_layout()
+_ACCESSIBLE = int(len(_TOP_IDX))                     # packets actually scored (top layer)
 
 # Tolerances
 FK_TOL        = 0.02     # m, how close the suction face must actually get to the target
@@ -406,8 +411,8 @@ def joint_limits(rid, joints):
 
 # ----------------------------------------------------------------------------
 # Target grid -- the fully-packed pallet (computed once in _packed_layout). Each
-# target is a PACKET CENTER (z = its layer's top face). Every packet is scored, each as
-# the exposed surface at its own depth (top-down unpacking).
+# target is a PACKET CENTER (z = its layer's top face). Most are `buried`; only the
+# top of each column is scored.
 # ----------------------------------------------------------------------------
 def bin_targets():
     return _PACKED_PTS, _PACKED_XS, _PACKED_YS, _PACKED_ZS
@@ -693,7 +698,7 @@ def _convex_intersect_area(subject, clip):
 
 # ----------------------------------------------------------------------------
 # Pickability (packed): because packets sit at packet pitch (too coarse for the
-# grid-dilation the sampling sims use), each packet is tested directly with
+# grid-dilation the sampling sims use), each accessible packet is tested directly with
 # a FINE off-center tool search -- tool-center offsets on a FINE_STEP grid that keep
 # >= PACKET_CONTACT_FRAC of the packet under the foam. A packet is pickable if a level,
 # collision-free placement exists at any such offset; near-wall packets the centered
@@ -731,7 +736,7 @@ def _fine_offsets(orientations):
     return out
 
 def _pick_packet(w, t):
-    """Can the gripper pick the packet centred at `t`? Returns
+    """Can the gripper pick the accessible packet centred at `t`? Returns
     (pickable, centered_placement, accepted_sol). Tries the centered placement first
     (any clocking), then off-center placements (per-clocking fine offsets) until one is
     valid. `accepted_sol` is that solve_pick dict (or None) for the dump/animation."""
@@ -771,25 +776,26 @@ def build_world(force_gui=False):
     return {"rid": rid, "bin_id": bin_id, "gripper_id": gripper_id,
             "joints": joints, "lo": lo, "hi": hi, "ee": ee,
             "seeds": ik_seeds(lo, hi), "orientations": orientations,
-            "targets": targets, "fine_offsets": _fine_offsets(orientations)}
+            "targets": targets, "fine_offsets": _fine_offsets(orientations),
+            "top_idx": _TOP_IDX}
 
 def _worker_init():
     global _W
     _W = build_world()
 
 def _eval_pose(args):
-    """Evaluate one base pose -> (pose_idx, pickable_mask, center_mask). EVERY packet in
-    the pack is scored, each as the exposed surface at its own depth: pickable = a level,
-    collision-free placement covers >= PACKET_CONTACT_FRAC of it (centered or via the fine
-    off-center search); center_mask = the subset where the plate can be CENTERED on the
-    packet (a real placement, drives the animation/dump)."""
+    """Evaluate one base pose -> (pose_idx, pickable_mask, center_mask). Only ACCESSIBLE
+    (top-of-column) packets are scored; buried ones stay False. pickable = a level,
+    collision-free placement covers >= PACKET_CONTACT_FRAC of the packet (centered or via
+    the fine off-center search); center_mask = the subset where the plate can be CENTERED
+    on the packet (a real placement, drives the animation/dump)."""
     pose_idx, bx, by, bz, byaw = args
     w = _W
     set_base(w["rid"], (bx, by), bz, byaw)
     n = len(w["targets"])
     pickable = np.zeros(n, dtype=bool)
     center = np.zeros(n, dtype=bool)
-    for i in range(n):
+    for i in w["top_idx"]:
         ok, centered, _ = _pick_packet(w, w["targets"][i])
         pickable[i] = ok
         center[i] = centered
@@ -822,7 +828,9 @@ def _aggregate(targets, meta, results):
     for idx in range(len(meta)):
         covered, center = results[idx]
         iz, iy, ix, bx, by, bz, byaw = meta[idx]
-        cov = float(covered.mean())                   # over the WHOLE packed bin
+        # coverage is over ACCESSIBLE (top-of-column) packets only -- buried ones are
+        # never pickable and would dilute the metric.
+        cov = float(covered.sum()) / max(_ACCESSIBLE, 1)
         coverage[iz, iy, ix] = max(coverage[iz, iy, ix], cov)
         target_hits += covered
         ranked.append((cov, idx, bx, by, bz, byaw, covered, center))
@@ -943,7 +951,7 @@ def run():
     def _print_pose(tag, b):
         print(f"  {tag}: x={b['xy'][0]:+.3f} y={b['xy'][1]:+.3f} z={b['z']:.3f} m  "
               f"yaw={math.degrees(b['yaw']):+5.1f} deg  ->  {b['cov']*100:5.1f}%  "
-              f"({int(b['mask'].sum())}/{len(targets)} packets)")
+              f"({int(b['mask'].sum())}/{_ACCESSIBLE} accessible packets)")
 
     print(f"\nTop {len(bests)} base poses by coverage:")
     for r, b in enumerate(bests, 1):
@@ -1057,35 +1065,27 @@ def plot_coverage_grid(coverage, best):
     plt.close(fig)
     return path
 
-def _layer_grid(n):
-    """A roughly-square (nrows, ncols) layout for n depth-layer panels (the packed bin
-    can have many layers, so a 1xN montage would be unusably wide)."""
-    ncols = min(n, 6)
-    nrows = int(math.ceil(n / ncols))
-    return nrows, ncols
-
 def plot_best_slices(best, xs, ys, zs):
-    """Pickable packets at the best base, every packed layer in a grid (bottom-left =
-    deepest layer, increasing depth-index across/up). Each packet is scored as the
-    surface at its depth."""
-    mask = best["mask"].reshape(N_Z, N_Y, N_X)
+    """Pickable packets at the best base -- the ACCESSIBLE top layer only (deeper layers
+    are all buried/unpickable, so a per-depth montage would be all-red panels)."""
+    k = N_Z - 1                                      # top-of-column layer
+    mask = best["mask"].reshape(N_Z, N_Y, N_X)[k]
     extent = _cell_extent(xs, ys)
-    nrows, ncols = _layer_grid(N_Z)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(2.4 * ncols, 2.5 * nrows),
-                             squeeze=False)
-    for k in range(nrows * ncols):
-        a = axes[k // ncols][k % ncols]
-        if k >= N_Z:
-            a.axis("off"); continue
-        a.imshow(mask[k], origin="lower", cmap="RdYlGn", vmin=0, vmax=1,
-                 extent=extent, aspect="equal")
-        _bin_footprint(a, ec="black", lw=0.8, alpha=0.5)
-        a.set_xticks([]); a.set_yticks([])
-        a.set_title(f"z={zs[k]:.2f}m  {int(mask[k].sum())}/{mask[k].size}", fontsize=8)
-    fig.suptitle(f"Pickable packets by layer at best base  "
+    fig, a = plt.subplots(figsize=(5.0, 4.6))
+    a.imshow(mask, origin="lower", cmap="RdYlGn", vmin=0, vmax=1,
+             extent=extent, aspect="equal")
+    _bin_footprint(a, ec="black", lw=1.0, alpha=0.5)
+    a.set_xticks(np.round(xs, 2)); a.set_yticks(np.round(ys, 2))
+    a.tick_params(labelsize=7)
+    for lbl in a.get_xticklabels():
+        lbl.set_rotation(90)
+    a.set_xlabel("x (m)"); a.set_ylabel("y (m)")
+    fig.suptitle(f"Pickable top-layer packets at best base  "
                  f"(x={best['xy'][0]:+.2f}, y={best['xy'][1]:+.2f}, "
-                 f"z={best['z']:.2f} m, yaw={math.degrees(best['yaw']):+.0f}deg)   "
-                 f"green = pickable ({PACKET_CONTACT_FRAC*100:.0f}% under foam), red = not",
+                 f"z={best['z']:.2f} m, yaw={math.degrees(best['yaw']):+.0f}deg)\n"
+                 f"{int(mask.sum())}/{mask.size} pickable "
+                 f"({mask.mean()*100:.0f}%)   green = pickable "
+                 f"({PACKET_CONTACT_FRAC*100:.0f}% of packet under foam), red = not",
                  fontsize=10)
     fig.tight_layout()
     path = os.path.join(RUN_DIR, "best_pos_slices.png")
@@ -1156,27 +1156,24 @@ def plot_coverage_vs_height(coverage):
     return path
 
 def plot_target_frequency(target_freq, xs, ys, zs):
-    """For every packet, the % of all swept base positions that can pick it -- every
-    packed layer in a grid; highlights intrinsically hard spots at each depth."""
-    freq = target_freq.reshape(N_Z, N_Y, N_X) * 100
+    """For every ACCESSIBLE (top-layer) packet, the % of all swept base positions that
+    can pick it -- highlights intrinsically hard spots (deeper layers are all buried)."""
+    k = N_Z - 1
+    freq = target_freq.reshape(N_Z, N_Y, N_X)[k] * 100
     extent = _cell_extent(xs, ys)
-    nrows, ncols = _layer_grid(N_Z)
-    fig, axes = plt.subplots(nrows, ncols, figsize=(2.4 * ncols, 2.5 * nrows),
-                             squeeze=False)
-    im = None
-    for k in range(nrows * ncols):
-        a = axes[k // ncols][k % ncols]
-        if k >= N_Z:
-            a.axis("off"); continue
-        im = a.imshow(freq[k], origin="lower", cmap="magma", vmin=0, vmax=100,
-                      extent=extent, aspect="equal")
-        _bin_footprint(a, ec="cyan", lw=0.8, alpha=0.6)
-        a.set_xticks([]); a.set_yticks([])
-        a.set_title(f"z={zs[k]:.2f}m  (mean {freq[k].mean():.0f}%)", fontsize=8)
-    fig.suptitle("Packet pickability across ALL base positions, by layer "
+    fig, a = plt.subplots(figsize=(5.2, 4.6))
+    im = a.imshow(freq, origin="lower", cmap="magma", vmin=0, vmax=100,
+                  extent=extent, aspect="equal")
+    for iy, yv in enumerate(ys):
+        for ix, xv in enumerate(xs):
+            v = freq[iy, ix]
+            a.text(xv, yv, f"{v:.0f}", ha="center", va="center",
+                   fontsize=7, color="white" if v < 55 else "black")
+    _bin_footprint(a, ec="cyan", lw=1.0, alpha=0.6)
+    a.set_xlabel("x (m)"); a.set_ylabel("y (m)")
+    fig.suptitle("Top-layer packet pickability across ALL base positions\n"
                  "(% of swept bases that can pick each packet)", fontsize=10)
-    if im is not None:
-        fig.colorbar(im, ax=axes.ravel().tolist(), label="% of bases")
+    fig.colorbar(im, ax=a, label="% of bases")
     path = os.path.join(RUN_DIR, "target_reachability.png")
     fig.savefig(path, dpi=130)
     plt.close(fig)
@@ -1204,17 +1201,22 @@ def _acc_sol_rec(sol):
                              if USE_GRIPPER else 0.0), "accepted": True}
 
 def _pick_records(world, base, targets, covered, sol_seeds=None):
-    """Per-packet detail for one base pose (packed pallet). EVERY packet is scored (as the
-    surface at its depth): `covered` is the pickability, the real pick (centered OR the
-    fine off-center placement) supplies the top-level joint config, and -- with
-    `sol_seeds` -- every distinct IK config for the centered TCP is enumerated into
-    `solutions` (valid + failed, with the reason) for the viewer's click-inspect / failure
-    paths. An off-center pick is prepended as the accepted solution so the viewer can show
-    the actual grasp, not just the (failing) centered attempts."""
+    """Per-packet detail for one base pose (packed pallet). BURIED packets get only a
+    flag (not scored). For ACCESSIBLE packets, `covered` is the pickability, the real
+    pick (centered OR the fine off-center placement) supplies the top-level joint config,
+    and -- with `sol_seeds` -- every distinct IK config for the centered TCP is enumerated
+    into `solutions` (valid + failed, with the reason) for the viewer's click-inspect /
+    failure paths. An off-center pick is prepended as the accepted solution so the viewer
+    can show the actual grasp, not just the (failing) centered attempts."""
     set_base(world["rid"], base["xy"], base["z"], base["yaw"])
     recs = []
     for i, (t, cov) in enumerate(zip(targets, covered)):
-        rec = {"target_m": [round(float(v), 4) for v in t], "pickable": bool(cov)}
+        rec = {"target_m": [round(float(v), 4) for v in t],
+               "pickable": bool(cov), "buried": bool(_BURIED[i])}
+        if _BURIED[i]:
+            rec["is_placement"] = False
+            recs.append(rec)
+            continue
         ok, centered, sol = _pick_packet(world, t)
         rec["is_placement"] = centered
         if sol_seeds is not None:
@@ -1253,7 +1255,8 @@ def _best_block(world, b, rank, targets, zs, sol_seeds=None):
                  "z": round(float(b["z"]), 4),
                  "yaw_deg": round(math.degrees(b["yaw"]), 2)},
         "coverage_pct": round(b["cov"] * 100, 2),
-        "pickable": int(b["mask"].sum()), "total": int(b["mask"].size),  # whole pack
+        "pickable": int(b["mask"].sum()), "total": int(_ACCESSIBLE),  # accessible top layer
+        "buried": int(_BURIED.sum()),
         "placements": int(b["center_mask"].sum()),
         "per_depth": per_depth,
         "picks": recs,
@@ -1297,9 +1300,9 @@ def dump_best_data(world, bests, diverse, targets, coverage, target_freq):
                    "contact_frac": PACKET_CONTACT_FRAC,
                    "note": "axis-aligned box, top face at the target z; pickable when "
                            ">= contact_frac of the packet top is covered by the tool bottom"},
-        "packed": {"nx": N_X, "ny": N_Y, "nz": N_Z, "n_packets": int(len(_PACKED_PTS)),
-                   "note": "bin filled edge-to-edge from the packet size; every packet "
-                           "scored as the exposed surface at its depth (top-down unpacking)"},
+        "packed": {"nx": N_X, "ny": N_Y, "nz": N_Z, "accessible": _ACCESSIBLE,
+                   "note": "bin filled edge-to-edge from the packet size; only the top "
+                           "packet of each column is scored, deeper ones are 'buried'"},
         "tolerances": {"fk_tol_m": FK_TOL, "collide_tol_m": COLLIDE_TOL,
                        "tilt_cone_deg": TILT_CONE_DEG, "ori_tol_deg": ORI_TOL_DEG,
                        "reach_max_m": REACH_MAX},
@@ -1346,13 +1349,16 @@ def dump_best_data(world, bests, diverse, targets, coverage, target_freq):
     return jpath
 
 def _add_target_markers(targets, mask):
-    """Visual-only PACKET boxes for the fully-packed pallet (every layer): green =
-    pickable, red = not. Each box's TOP face is at the target z (debug points/lines
-    aren't captured by getCameraImage)."""
+    """Visual-only PACKET boxes for the fully-packed pallet: green = pickable (top
+    layer), red = accessible-but-not-pickable, gray = buried. Each box's TOP face is at
+    the target z (debug points/lines aren't captured by getCameraImage)."""
     he = [PACKET_L / 2, PACKET_W / 2, PACKET_H / 2]
     ids = []
     for i, (t, ok) in enumerate(zip(targets, mask)):
-        color = [0.1, 0.9, 0.2, 1] if ok else [0.9, 0.15, 0.15, 1]
+        if _BURIED[i]:
+            color = [0.5, 0.5, 0.55, 1]
+        else:
+            color = [0.1, 0.9, 0.2, 1] if ok else [0.9, 0.15, 0.15, 1]
         vis = p.createVisualShape(p.GEOM_BOX, halfExtents=he, rgbaColor=color)
         ids.append(p.createMultiBody(baseMass=0, baseCollisionShapeIndex=-1,
                                      baseVisualShapeIndex=vis,
