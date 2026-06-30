@@ -170,7 +170,7 @@ MARGIN = 0.06                    # z clearance only: packet tops stay this far b
 # already size-driven.) Nominal packet: 4.75 in x 9.75 in x 0.625 in.
 _IN = 0.0254                     # inches -> meters
 PACKET_L = 4.75  * _IN           # 0.1207 m, packet extent along world x
-PACKET_W = 9.75 * _IN            # 0.2477 m, packet extent along world y
+PACKET_W = 8.0  * _IN            # 0.2032 m, packet extent along world y
 PACKET_H = 0.625 * _IN           # 0.0159 m, packet thickness (top face = pick plane)
 # A packet is pickable when the gripper can be placed (reachable, level, collision-free)
 # so that at least this fraction of the PACKET's top face is covered by (in contact
