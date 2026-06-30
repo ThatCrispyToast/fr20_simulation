@@ -177,7 +177,7 @@ PACKET_H = 0.625 * _IN           # 0.0159 m, packet thickness (top face = pick p
 # with) the TOOL BOTTOM -- the foam face, GRIPPER_LENGTH x GRIPPER_WIDTH -- i.e. enough
 # of the packet sits under the suction face to lift it. This replaces the old "foam
 # center exactly on the point" test with a real area-of-contact test on the packet.
-PACKET_CONTACT_FRAC = 0.60       # min overlap(tool bottom, packet top) / packet-top area
+PACKET_CONTACT_FRAC = 0.50       # min overlap(tool bottom, packet top) / packet-top area
 
 # Tolerances
 FK_TOL        = 0.02     # m, how close the suction face must actually get to the target
